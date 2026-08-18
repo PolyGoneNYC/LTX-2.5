@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PIL import Image, ImageDraw, ImageFilter, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
 
 DEFAULT_CHARACTER_SCALE = 0.75
 
@@ -71,13 +71,22 @@ def compose_character_scene(
     width: int,
     height: int,
     output_path: str,
+    mask_output_path: str | None = None,
 ) -> str:
     """Composite a background plate with one or more character cutouts into a single image at
     exactly (width, height). Characters are bottom-anchored (feet on the background's ground
     plane) and horizontally centered at their ``x_frac``. The result is meant to be used as the
     frame-0 image conditioning input for an image-to-video pipeline.
+
+    If *mask_output_path* is given, also writes a grayscale footprint mask of the same size:
+    white where a character was pasted (union of every character's alpha layer), black
+    everywhere else (the untouched background). See
+    :func:`ltx_pipelines.character_scene_locked_bg._background_lock_conditioning`, which uses
+    this mask's *inverse* to hard-lock the background region for the whole clip while leaving
+    the character region free to animate.
     """
     canvas = _cover_resize(Image.open(background_path).convert("RGB"), width, height).convert("RGBA")
+    footprint = Image.new("L", (width, height), 0) if mask_output_path else None
 
     for char in characters:
         target_h = max(1, round(height * char.scale))
@@ -86,6 +95,12 @@ def compose_character_scene(
         x = max(0, min(x, width - layer.width)) if layer.width <= width else (width - layer.width) // 2
         y = height - layer.height
         canvas.alpha_composite(layer, (x, y))
+        if footprint is not None:
+            alpha = layer.getchannel("A")
+            existing = footprint.crop((x, y, x + layer.width, y + layer.height))
+            footprint.paste(ImageChops.lighter(existing, alpha), (x, y))
 
     canvas.convert("RGB").save(output_path)
+    if mask_output_path:
+        footprint.save(mask_output_path)
     return output_path

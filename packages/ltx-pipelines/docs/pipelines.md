@@ -245,3 +245,34 @@ uv run python -m ltx_pipelines.character_scene_interpolation \
 ```
 
 **Use when:** `CharacterSceneI2VidPipeline` drift is showing up specifically toward the end of the clip, or you need the character to visibly return to their reference look by the final frame (e.g. a loop, or a cut that must match the next shot's starting frame).
+
+---
+
+## 15. CharacterSceneLockedBackgroundPipeline
+
+**Best for:** Scenes where not just the character but the *background* changes over the course of the clip, and it shouldn't.
+
+**Source**: [`src/ltx_pipelines/character_scene_locked_bg.py`](../src/ltx_pipelines/character_scene_locked_bg.py)
+
+The other `CharacterScene*` pipelines only lock specific **frames** (frame 0, and optionally the last frame) — every pixel in every other frame, background included, is free-generated and can drift, since the model has no separate notion of "background" vs. "character." This pipeline instead locks a **region**: the background pixels are hard-clamped to the composited scene image for *every* frame of the clip, using `VideoConditionByMask` (an existing `ltx-core` primitive previously only used by `ltx-trainer`'s validation runner — this is its first user-facing pipeline use). The character region — auto-derived from which pixels the character cutouts actually covered during compositing, see [`utils/scene_compositing.py`](../src/ltx_pipelines/utils/scene_compositing.py) — is left fully free (`denoise_mask=1`) so it can still move and animate normally.
+
+Because the lock applies to every frame rather than just the anchors, nothing in the model is trying to regenerate the background at all — it genuinely cannot drift, at the cost of the background also being unable to move (no camera pans/zooms, no background motion). Combine with `--image` for additional character-identity anchors if the character alone still drifts.
+
+**Extra CLI arguments:** `--background PATH` / `--character PATH [X_FRAC] [SCALE]` (required, same as `CharacterSceneI2VidPipeline`), `--scene-strength` (frame-0 anchor strength, default `1.0`), `--background-lock-strength` (default `1.0`; lower it if you want the background to have some give, e.g. subtle lighting flicker, instead of being perfectly static), `--scene-output PATH` (prefix for the composited scene image and its footprint mask, for inspection). All other flags match `TI2VidTwoStagesPipeline`.
+
+```bash
+uv run python -m ltx_pipelines.character_scene_locked_bg \
+    --transformer-path       models/ltx-2.5/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors \
+    --text-encoder-path      models/ltx-2.5/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors \
+    --video-vae-path         models/ltx-2.5/vae/ltx-2.5-video-vae-bf16.safetensors \
+    --audio-vae-path         models/ltx-2.5/vae/ltx-2.5-audio-vae-bf16.safetensors \
+    --spatial-upsampler-path models/ltx-2.5/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
+    --distilled-lora         models/ltx-2.5/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors \
+    --background  scene/kitchen.png \
+    --character   scene/alice_cutout.png 0.33 0.8 \
+    --character   scene/bob_cutout.png   0.66 0.75 \
+    --num-frames 121 --seed 42 --output-path output.mp4 \
+    --prompt "Alice and Bob stand in the kitchen, talking and laughing."
+```
+
+**Use when:** the background itself is drifting (furniture, wall colors, lighting changing shot to shot), not just the character, and a fully static background is acceptable for the shot.
