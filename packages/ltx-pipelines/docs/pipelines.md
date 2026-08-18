@@ -212,3 +212,36 @@ uv run python -m ltx_pipelines.character_scene_i2vid \
 ```
 
 **Use when:** A scene has two (or more) named characters whose faces/outfits must not drift across the video, and you have (or can prepare) reference images of the background and each character.
+
+**Note:** this only anchors **frame 0**. `TI2VidTwoStagesPipeline` conditions frame 0 by replacing its latent outright (`combined_image_conditionings`, hard-clamped for the whole denoise), but every other frame — including the last one — is freely generated and only softly guided by attention. On a long clip that's enough room for a character to visibly drift by the end (e.g. losing their hair). If you need both endpoints locked, use `CharacterSceneInterpolationPipeline` below instead.
+
+---
+
+## 14. CharacterSceneInterpolationPipeline
+
+**Best for:** Multi-character scenes where the character must look the same at the *end* of the clip too, not just the start.
+
+**Source**: [`src/ltx_pipelines/character_scene_interpolation.py`](../src/ltx_pipelines/character_scene_interpolation.py)
+
+Same idea as `CharacterSceneI2VidPipeline`, but wraps `KeyframeInterpolationPipeline` instead of `TI2VidTwoStagesPipeline` and anchors a character composite at **both** frame 0 and the last frame. `KeyframeInterpolationPipeline` conditions every image — start and end alike — through the guiding-latent keyframe path (`image_conditionings_by_adding_guiding_latent`), which is the mechanism this codebase's own start/end interpolation tool uses; giving the model the same anchor to return to at the end is what keeps the character from drifting away from their reference appearance by the final frame.
+
+By default the end frame reuses the exact same composited image as the start frame (same background, same characters) — the simplest way to say "this character must look identical start to finish." Pass `--end-background` (and optionally `--end-character`) if the last frame should show a different shot with the same characters.
+
+**Extra CLI arguments:** `--background PATH` / `--character PATH [X_FRAC] [SCALE]` (required, same as `CharacterSceneI2VidPipeline`, for the start frame), `--end-background PATH` (optional; defaults to reusing the start composite for the end frame), `--end-character PATH [X_FRAC] [SCALE]` (optional, repeatable; only used with `--end-background`, defaults to reusing `--character`'s cutouts/placements), `--scene-strength` (default `1.0`, applies to both anchors), `--scene-output PATH` (prefix for the composited frames, for inspection). `--num-frames` is required (no auto-duration) since the end anchor's frame index must be known up front. All other flags match `KeyframeInterpolationPipeline`.
+
+```bash
+uv run python -m ltx_pipelines.character_scene_interpolation \
+    --transformer-path       models/ltx-2.5/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors \
+    --text-encoder-path      models/ltx-2.5/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors \
+    --video-vae-path         models/ltx-2.5/vae/ltx-2.5-video-vae-bf16.safetensors \
+    --audio-vae-path         models/ltx-2.5/vae/ltx-2.5-audio-vae-bf16.safetensors \
+    --spatial-upsampler-path models/ltx-2.5/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
+    --distilled-lora         models/ltx-2.5/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors \
+    --background  scene/kitchen.png \
+    --character   scene/alice_cutout.png 0.33 0.8 \
+    --character   scene/bob_cutout.png   0.66 0.75 \
+    --num-frames 121 --seed 42 --output-path output.mp4 \
+    --prompt "Alice and Bob stand in the kitchen, talking and laughing."
+```
+
+**Use when:** `CharacterSceneI2VidPipeline` drift is showing up specifically toward the end of the clip, or you need the character to visibly return to their reference look by the final frame (e.g. a loop, or a cut that must match the next shot's starting frame).
