@@ -85,6 +85,9 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+# ComfyUI custom nodes follow ComfyUI's own external API (mandated method names/casing like
+# INPUT_TYPES, untyped `execute`), not this repo's conventions.
+"comfyui_custom_nodes/**" = ["N802", "ANN001", "ANN201", "ANN206"]
 # CI gates: stand-alone CLIs whose whole job is printing a report / GitHub annotations.
 ".github/actions/test-collection-completeness/check_test_collection.py" = ["T201"]
 ".github/actions/golden-pairing-gate/check_golden_pairing.py" = ["T201"]
