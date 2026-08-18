@@ -181,3 +181,34 @@ uv run python -m ltx_pipelines.dfr_pipeline \
 **Note:** Requires a checkpoint that supports generated keyframe slots (LTX-2.5 and later) and a distilled LoRA.
 
 **Use when:** Detail fidelity matters more than wall-clock time, or you want a higher effective frame rate than the base model produces.
+
+---
+
+## 13. CharacterSceneI2VidPipeline
+
+**Best for:** Multi-character scenes where you need each character's appearance to stay consistent for the whole clip.
+
+**Source**: [`src/ltx_pipelines/character_scene_i2vid.py`](../src/ltx_pipelines/character_scene_i2vid.py)
+
+Thin CLI wrapper around `TI2VidTwoStagesPipeline`. Instead of describing the background and characters in the prompt alone, you pass a background plate and one or more character cutouts; they're composited into a single concrete frame-0 image (see [`utils/scene_compositing.py`](../src/ltx_pipelines/utils/scene_compositing.py)) and used as strength-1.0 image conditioning. Anchoring each character's actual pixels at frame 0 — rather than relying on the text prompt to keep reinventing them each frame — is what keeps their look from drifting over the clip.
+
+Character cutouts should ideally be transparent PNGs (e.g. from a background-removal tool) for the cleanest composite; opaque photos are also accepted and get a soft feathered edge instead of a hard paste seam. Characters are bottom-anchored (feet on the background's ground plane) and horizontally spaced across the frame — evenly by default, or at an explicit `X_FRAC` per character.
+
+**Extra CLI arguments:** `--background PATH` (required), `--character PATH [X_FRAC] [SCALE]` (required, repeatable — pass twice for two characters), `--scene-strength` (default `1.0`), `--scene-output PATH` (where to save the composited frame for inspection; defaults next to `--output-path`). All other flags match `TI2VidTwoStagesPipeline`.
+
+```bash
+uv run python -m ltx_pipelines.character_scene_i2vid \
+    --transformer-path       models/ltx-2.5/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors \
+    --text-encoder-path      models/ltx-2.5/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors \
+    --video-vae-path         models/ltx-2.5/vae/ltx-2.5-video-vae-bf16.safetensors \
+    --audio-vae-path         models/ltx-2.5/vae/ltx-2.5-audio-vae-bf16.safetensors \
+    --spatial-upsampler-path models/ltx-2.5/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
+    --distilled-lora         models/ltx-2.5/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors \
+    --background  scene/kitchen.png \
+    --character   scene/alice_cutout.png 0.33 0.8 \
+    --character   scene/bob_cutout.png   0.66 0.75 \
+    --num-frames 121 --seed 42 --output-path output.mp4 \
+    --prompt "Alice and Bob stand in the kitchen, talking and laughing."
+```
+
+**Use when:** A scene has two (or more) named characters whose faces/outfits must not drift across the video, and you have (or can prepare) reference images of the background and each character.
