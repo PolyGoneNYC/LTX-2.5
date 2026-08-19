@@ -69,7 +69,10 @@ def _run_light_asd(video_path: str, light_asd_repo: str, weight_path: str, work_
         "--pretrainModel",
         weight_path,
     ]
-    subprocess.run(cmd, cwd=light_asd_repo, check=True)
+    result = subprocess.run(cmd, cwd=light_asd_repo, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        tail = "\n".join(result.stderr.strip().splitlines()[-20:])
+        raise RuntimeError(f"Light-ASD (Columbia_test.py) failed:\n{tail}")
 
     pywork = video_folder / video_name / "pywork"
     with open(pywork / "tracks.pckl", "rb") as f:
@@ -225,7 +228,13 @@ class LTXVLockCharacterVoice:
                 "light_asd_repo": ("STRING", {"default": "custom_nodes/ltxv_voice_lock/third_party/Light-ASD"}),
                 "light_asd_weight": (
                     "STRING",
-                    {"default": "custom_nodes/ltxv_voice_lock/third_party/Light-ASD/weight/finetuning_TalkSet.model"},
+                    {
+                        "default": "weight/finetuning_TalkSet.model",
+                        "tooltip": (
+                            "Path relative to light_asd_repo (Columbia_test.py is run with that as its "
+                            "working directory, so this must NOT be re-prefixed with light_asd_repo again)."
+                        ),
+                    },
                 ),
                 "converter_config": (
                     "STRING",
