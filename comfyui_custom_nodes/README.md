@@ -29,3 +29,26 @@ only edits the `LATENT` dict, so it drops into an existing latent wire without t
 positive/negative conditioning.
 
 See the file's own module docstring for the full technical rationale.
+
+## `ltxv_voice_lock/` — LTXV Lock Character Voice
+
+A separate node package (its own folder, since it has heavy optional dependencies) that
+re-voices one enrolled character's speaking segments in a generated clip. See
+`ltxv_voice_lock/README.md` for install and usage.
+
+## Ready-to-load example workflows
+
+Both of these start from the official "First & Last Frame to Video (LTX-2.5)" ComfyUI template
+and splice the custom node(s) above directly into it, so you can load one as-is instead of
+wiring nodes by hand in the ComfyUI editor:
+
+- `example_workflow_lock_bg.json` — adds only **LTXV Lock Background Region**.
+- `example_workflow_lock_bg_and_voice.json` — adds **LTXV Lock Background Region** *and*
+  **LTXV Lock Character Voice**. After loading it, set the two new `Load Image`/`Load Audio`
+  nodes near the voice-lock node to your character's reference photo and voice clip.
+
+Both were built by a script that computes new node/link IDs from the real file (never
+hand-edited) and verified with an automated self-consistency check: every link's origin/target
+agree in both directions, no duplicate IDs, and a diff confirms only the intended nodes/links
+changed -- everything else, including the entire subgraph the template packs its actual pipeline
+into, is byte-identical to the original.
