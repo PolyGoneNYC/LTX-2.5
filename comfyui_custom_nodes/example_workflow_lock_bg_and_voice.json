@@ -485,7 +485,7 @@
       },
       "widgets_values": [
         "custom_nodes/ltxv_voice_lock/third_party/Light-ASD",
-        "custom_nodes/ltxv_voice_lock/third_party/Light-ASD/weight/finetuning_TalkSet.model",
+        "weight/finetuning_TalkSet.model",
         "custom_nodes/ltxv_voice_lock/checkpoints/converter/config.json",
         "custom_nodes/ltxv_voice_lock/checkpoints/converter/checkpoint.pth",
         0.35,
