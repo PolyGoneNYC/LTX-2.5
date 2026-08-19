@@ -175,9 +175,13 @@ def speaking_segments(
 # ---------------------------------------------------------------------------
 
 
-def extract_audio(video_path: str, out_wav: Path, sample_rate: int) -> None:
+def extract_audio(video_path: str, out_wav: Path) -> None:
+    """Extract audio at its native sample rate and channel count -- no forced -ac/-ar, so
+    revoice_and_splice can preserve the original's channel count and quality everywhere except
+    the segments actually being re-voiced.
+    """
     subprocess.run(
-        ["ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1", "-ar", str(sample_rate), str(out_wav)],
+        ["ffmpeg", "-y", "-i", video_path, "-vn", str(out_wav)],
         check=True,
         capture_output=True,
     )
@@ -195,22 +199,32 @@ def revoice_and_splice(
     """For each segment, run OpenVoice tone-color conversion (source style extracted from that
     segment itself) and splice the converted audio back into a copy of the full track, with a
     short linear crossfade at each boundary to avoid audible clicks.
+
+    Operates on the track's own native sample rate and channel count throughout; only the
+    portion actually being re-voiced is downmixed to mono for OpenVoice (which requires it) and
+    then duplicated back across channels for that segment alone -- audio outside the segments,
+    and each channel's original stereo image there, is untouched. extract_se/convert internally
+    resample whatever they're given to the model's own rate via librosa.load(sr=...), so segments
+    are written at the track's native rate as-is; only the returned converted audio (written at
+    the model's rate) needs resampling back.
     """
     import soundfile as sf
+    import torch
+    import torchaudio
 
-    sample_rate = converter.hps.data.sampling_rate
     full_audio_path = work_dir / "full_audio.wav"
-    extract_audio(video_path, full_audio_path, sample_rate)
-    audio, sr = sf.read(full_audio_path)
-    assert sr == sample_rate
-    audio = audio.astype(np.float64)
+    extract_audio(video_path, full_audio_path)
+    raw_audio, sample_rate = sf.read(full_audio_path, always_2d=True)  # raw_audio: [T, C]
+    audio = raw_audio.T.astype(np.float64)  # [C, T]
+    num_channels = audio.shape[0]
 
     crossfade_n = int(crossfade_seconds * sample_rate)
 
     for i, (start_s, end_s) in enumerate(segments):
         start_i, end_i = int(start_s * sample_rate), int(end_s * sample_rate)
+        segment_mono = audio[:, start_i:end_i].mean(axis=0) if num_channels > 1 else audio[0, start_i:end_i]
         seg_path = work_dir / f"segment_{i}.wav"
-        sf.write(seg_path, audio[start_i:end_i], sample_rate)
+        sf.write(seg_path, segment_mono, sample_rate)
 
         src_se = converter.extract_se([str(seg_path)], se_save_path=None)
         converted_path = work_dir / f"segment_{i}.converted.wav"
@@ -221,7 +235,11 @@ def revoice_and_splice(
             output_path=str(converted_path),
             tau=tau,
         )
-        converted, _ = sf.read(converted_path)
+        converted, converted_sr = sf.read(converted_path)
+        if converted_sr != sample_rate:
+            converted = torchaudio.functional.resample(
+                torch.from_numpy(converted.astype(np.float32)), converted_sr, sample_rate
+            ).numpy()
         converted = converted.astype(np.float64)
         # OpenVoice's output length can differ slightly from the source segment's; trim/pad to fit
         # so splicing back doesn't shift everything after it.
@@ -235,14 +253,14 @@ def revoice_and_splice(
         if n > 0:
             fade_in = np.linspace(0, 1, n)
             fade_out = 1 - fade_in
-            converted[:n] = converted[:n] * fade_in + audio[start_i : start_i + n] * fade_out
-            converted[-n:] = converted[-n:] * fade_out + audio[end_i - n : end_i] * fade_in
+            converted[:n] = converted[:n] * fade_in + segment_mono[:n] * fade_out
+            converted[-n:] = converted[-n:] * fade_out + segment_mono[-n:] * fade_in
 
-        audio[start_i:end_i] = converted
+        audio[:, start_i:end_i] = np.tile(converted, (num_channels, 1))
         print(f"  re-voiced segment {start_s:.2f}s - {end_s:.2f}s")
 
     out_path = work_dir / "revoiced_audio.wav"
-    sf.write(out_path, audio, sample_rate)
+    sf.write(out_path, audio.T, sample_rate)  # soundfile expects [T, C] (frames-major), not [C, T]
     return out_path
 
 
