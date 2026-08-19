@@ -93,6 +93,7 @@ ignore = [
 # module stays importable/lintable without them (same rationale as the ltx-kernels PLC0415
 # ignores above), and it prints progress to the user like any CLI script.
 "voice_lock/**" = ["T201", "ANN001", "ANN201", "ANN202", "ANN206", "PLC0415"]
+"comfyui_custom_nodes/ltxv_voice_lock/**" = ["T201", "ANN001", "ANN201", "ANN202", "ANN206", "PLC0415", "PLR0915"]
 # CI gates: stand-alone CLIs whose whole job is printing a report / GitHub annotations.
 ".github/actions/test-collection-completeness/check_test_collection.py" = ["T201"]
 ".github/actions/golden-pairing-gate/check_golden_pairing.py" = ["T201"]
