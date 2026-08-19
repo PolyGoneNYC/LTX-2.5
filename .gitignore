@@ -44,6 +44,9 @@ wandb/
 *.wav
 *.webp
 
+# ComfyUI example workflow files (small plain-text graphs, not media -- checked in directly)
+!comfyui_custom_nodes/*.json
+
 # Full-params expected results for the --full-e2e quality lane (checked in via Git LFS)
 !packages/ltx-pipelines/tests/assets/full_e2e/
 !packages/ltx-pipelines/tests/assets/full_e2e/*.mp4
