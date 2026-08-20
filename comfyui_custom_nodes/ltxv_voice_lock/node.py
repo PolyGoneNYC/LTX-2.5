@@ -1,8 +1,10 @@
-"""ComfyUI node: re-voice one enrolled character's speaking segments in a generated video.
+"""ComfyUI node: re-voice up to 4 enrolled characters' speaking segments in a generated video.
 
 Runs entirely inside the ComfyUI graph -- no separate script, no output file to hand back in.
 Wire it in right after wherever your workflow produces a VIDEO (e.g. the LTX-2.5 subgraph's
-output) and before SaveVideo.
+output) and before SaveVideo. Face detection and tracking (Light-ASD) runs once per video no
+matter how many characters are enrolled -- only the per-character identity match and voice
+conversion repeat.
 
 This is a from-scratch ComfyUI port of the same pipeline as the standalone
 voice_lock/lock_character_voice.py tool (same three libraries, same verified APIs), adapted to
@@ -104,10 +106,18 @@ def _crop_face_at_frame(
 
 
 def _identify_character_track(
-    video_path: str, tracks: list, face_app, target_embedding: np.ndarray, match_threshold: float
+    video_path: str,
+    tracks: list,
+    face_app,
+    target_embedding: np.ndarray,
+    match_threshold: float,
+    exclude: set[int] | None = None,
 ) -> tuple[int | None, float]:
+    exclude = exclude or set()
     best_idx, best_score = None, -1.0
     for track_idx, track in enumerate(tracks):
+        if track_idx in exclude:
+            continue
         frame_ids = track["track"]["frame"]
         sample_positions = np.linspace(0, len(frame_ids) - 1, num=min(5, len(frame_ids)), dtype=int)
         similarities = []
@@ -217,48 +227,68 @@ def _revoice_segments_in_waveform(
     return audio
 
 
+MAX_CHARACTERS = 4
+
+
 class LTXVLockCharacterVoice:
     @classmethod
     def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "video": ("VIDEO",),
-                "character_photo": ("IMAGE", {"tooltip": "One reference photo of the character's face."}),
-                "character_voice": ("AUDIO", {"tooltip": "~5-10s reference clip of the character's target voice."}),
-                "light_asd_repo": ("STRING", {"default": "custom_nodes/ltxv_voice_lock/third_party/Light-ASD"}),
-                "light_asd_weight": (
-                    "STRING",
-                    {
-                        "default": "weight/finetuning_TalkSet.model",
-                        "tooltip": (
-                            "Path relative to light_asd_repo (Columbia_test.py is run with that as its "
-                            "working directory, so this must NOT be re-prefixed with light_asd_repo again)."
-                        ),
-                    },
-                ),
-                "converter_config": (
-                    "STRING",
-                    {"default": "custom_nodes/ltxv_voice_lock/checkpoints/converter/config.json"},
-                ),
-                "converter_ckpt": (
-                    "STRING",
-                    {"default": "custom_nodes/ltxv_voice_lock/checkpoints/converter/checkpoint.pth"},
-                ),
-                "match_threshold": ("FLOAT", {"default": 0.35, "min": -1.0, "max": 1.0, "step": 0.01}),
-                "speaking_threshold": ("FLOAT", {"default": 0.0, "min": -10.0, "max": 10.0, "step": 0.1}),
-                "min_segment_seconds": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 10.0, "step": 0.05}),
-                "tau": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "device": ("STRING", {"default": "cuda:0"}),
-            }
+        required = {
+            "video": ("VIDEO",),
+            "character_photo": ("IMAGE", {"tooltip": "Character 1's reference face photo."}),
+            "character_voice": ("AUDIO", {"tooltip": "Character 1's ~5-10s reference voice clip."}),
+            "light_asd_repo": ("STRING", {"default": "custom_nodes/ltxv_voice_lock/third_party/Light-ASD"}),
+            "light_asd_weight": (
+                "STRING",
+                {
+                    "default": "weight/finetuning_TalkSet.model",
+                    "tooltip": (
+                        "Path relative to light_asd_repo (Columbia_test.py is run with that as its "
+                        "working directory, so this must NOT be re-prefixed with light_asd_repo again)."
+                    ),
+                },
+            ),
+            "converter_config": (
+                "STRING",
+                {"default": "custom_nodes/ltxv_voice_lock/checkpoints/converter/config.json"},
+            ),
+            "converter_ckpt": (
+                "STRING",
+                {"default": "custom_nodes/ltxv_voice_lock/checkpoints/converter/checkpoint.pth"},
+            ),
+            "match_threshold": (
+                "FLOAT",
+                {"default": 0.35, "min": -1.0, "max": 1.0, "step": 0.01, "tooltip": "Applies to every character."},
+            ),
+            "speaking_threshold": (
+                "FLOAT",
+                {"default": 0.0, "min": -10.0, "max": 10.0, "step": 0.1, "tooltip": "Applies to every character."},
+            ),
+            "min_segment_seconds": (
+                "FLOAT",
+                {"default": 0.3, "min": 0.0, "max": 10.0, "step": 0.05, "tooltip": "Applies to every character."},
+            ),
+            "tau": (
+                "FLOAT",
+                {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Applies to every character."},
+            ),
+            "device": ("STRING", {"default": "cuda:0"}),
         }
+        optional = {}
+        for i in range(2, MAX_CHARACTERS + 1):
+            optional[f"character_photo_{i}"] = ("IMAGE", {"tooltip": f"Character {i}'s reference face photo."})
+            optional[f"character_voice_{i}"] = ("AUDIO", {"tooltip": f"Character {i}'s reference voice clip."})
+        return {"required": required, "optional": optional}
 
     RETURN_TYPES = ("VIDEO",)
     FUNCTION = "execute"
     CATEGORY = "audio/ltxv"
     DESCRIPTION = (
-        "Finds where an enrolled character is speaking (Light-ASD + InsightFace) and re-voices "
-        "just those segments to match a reference voice sample (OpenVoice), leaving every other "
-        "character's dialogue untouched. See this node package's README.md before first use."
+        "Finds where each enrolled character (up to 4) is speaking (Light-ASD + InsightFace) and "
+        "re-voices just their segments to match their own reference voice sample (OpenVoice), "
+        "leaving every unenrolled character's dialogue untouched. Face detection runs once for the "
+        "whole video regardless of how many characters are enrolled. See this node package's "
+        "README.md before first use."
     )
 
     def execute(  # noqa: PLR0913
@@ -275,9 +305,24 @@ class LTXVLockCharacterVoice:
         min_segment_seconds,
         tau,
         device,
+        character_photo_2=None,
+        character_voice_2=None,
+        character_photo_3=None,
+        character_voice_3=None,
+        character_photo_4=None,
+        character_voice_4=None,
     ):
         from insightface.app import FaceAnalysis
         from openvoice.api import ToneColorConverter
+
+        characters = [(character_photo, character_voice)]
+        for photo, voice in (
+            (character_photo_2, character_voice_2),
+            (character_photo_3, character_voice_3),
+            (character_photo_4, character_voice_4),
+        ):
+            if photo is not None and voice is not None:
+                characters.append((photo, voice))
 
         work_dir = Path(tempfile.mkdtemp(prefix="ltxv_voice_lock_"))
         components = video.get_components()
@@ -288,56 +333,74 @@ class LTXVLockCharacterVoice:
         video_path = str(work_dir / "input.mp4")
         video.save_to(video_path)
 
-        photo_path = work_dir / "character.jpg"
-        _save_photo(character_photo, photo_path)
-        voice_path = work_dir / "character_voice.wav"
-        _save_voice(character_voice, voice_path)
-
-        print("[LTXVLockCharacterVoice] enrolling character face embedding...")
+        print(f"[LTXVLockCharacterVoice] enrolling {len(characters)} character face embedding(s)...")
         face_app = FaceAnalysis(name="buffalo_l")
         face_app.prepare(ctx_id=0, det_size=(640, 640))
-        photo_img = cv2.imread(str(photo_path))
-        faces = face_app.get(photo_img)
-        if not faces:
-            raise RuntimeError("No face detected in character_photo -- cannot enroll.")
-        largest = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-        target_embedding = largest.normed_embedding
+
+        enrolled = []  # list of (character_number, target_embedding, voice_path)
+        for i, (photo, voice) in enumerate(characters, start=1):
+            photo_path = work_dir / f"character_{i}.jpg"
+            _save_photo(photo, photo_path)
+            voice_path = work_dir / f"character_{i}_voice.wav"
+            _save_voice(voice, voice_path)
+
+            photo_img = cv2.imread(str(photo_path))
+            faces = face_app.get(photo_img)
+            if not faces:
+                print(f"[LTXVLockCharacterVoice] character {i}: no face detected in photo -- skipping.")
+                continue
+            largest = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+            enrolled.append((i, largest.normed_embedding, voice_path))
+
+        if not enrolled:
+            print("[LTXVLockCharacterVoice] no character faces enrolled -- passing video through unchanged.")
+            return (video,)
 
         print("[LTXVLockCharacterVoice] running Light-ASD...")
         tracks, scores = _run_light_asd(video_path, light_asd_repo, light_asd_weight, work_dir)
         print(f"[LTXVLockCharacterVoice] found {len(tracks)} face track(s)")
 
-        track_idx, match_score = _identify_character_track(
-            video_path, tracks, face_app, target_embedding, match_threshold
-        )
-        if track_idx is None:
-            print(
-                f"[LTXVLockCharacterVoice] no track matched above threshold {match_threshold} "
-                f"(best: {match_score:.3f}) -- passing video through unchanged."
-            )
-            return (video,)
-        print(f"[LTXVLockCharacterVoice] matched track {track_idx} (similarity {match_score:.3f})")
-
-        segments = _speaking_segments(tracks[track_idx], scores[track_idx], speaking_threshold, min_segment_seconds)
-        if not segments:
-            print("[LTXVLockCharacterVoice] no speaking segments found -- passing video through unchanged.")
-            return (video,)
-        print(f"[LTXVLockCharacterVoice] {len(segments)} segment(s) to re-voice")
-
         converter = ToneColorConverter(converter_config, device=device)
         converter.watermark_model = None  # see voice_lock/lock_character_voice.py for why this
         converter.load_ckpt(converter_ckpt)
-        target_se = converter.extract_se([str(voice_path)], se_save_path=None)
 
         audio = components.audio
         sample_rate = int(audio["sample_rate"])  # audio is guaranteed non-None by the check above
         waveform = audio["waveform"][0].cpu().numpy()  # [C, T], original channel count preserved
 
-        new_waveform = _revoice_segments_in_waveform(
-            waveform, sample_rate, segments, converter, target_se, work_dir, tau
-        )
+        claimed_tracks: set[int] = set()
+        any_revoiced = False
+        for i, target_embedding, voice_path in enrolled:
+            track_idx, match_score = _identify_character_track(
+                video_path, tracks, face_app, target_embedding, match_threshold, exclude=claimed_tracks
+            )
+            if track_idx is None:
+                print(
+                    f"[LTXVLockCharacterVoice] character {i}: no track matched above threshold "
+                    f"{match_threshold} (best: {match_score:.3f}) -- skipping."
+                )
+                continue
+            claimed_tracks.add(track_idx)
+            print(f"[LTXVLockCharacterVoice] character {i}: matched track {track_idx} (similarity {match_score:.3f})")
+
+            segments = _speaking_segments(tracks[track_idx], scores[track_idx], speaking_threshold, min_segment_seconds)
+            if not segments:
+                print(f"[LTXVLockCharacterVoice] character {i}: no speaking segments found -- skipping.")
+                continue
+            print(f"[LTXVLockCharacterVoice] character {i}: {len(segments)} segment(s) to re-voice")
+
+            target_se = converter.extract_se([str(voice_path)], se_save_path=None)
+            waveform = _revoice_segments_in_waveform(
+                waveform, sample_rate, segments, converter, target_se, work_dir, tau
+            )
+            any_revoiced = True
+
+        if not any_revoiced:
+            print("[LTXVLockCharacterVoice] nothing re-voiced -- passing video through unchanged.")
+            return (video,)
+
         new_audio = {
-            "waveform": torch.from_numpy(new_waveform.astype(np.float32)).unsqueeze(0),
+            "waveform": torch.from_numpy(waveform.astype(np.float32)).unsqueeze(0),
             "sample_rate": sample_rate,
         }
 

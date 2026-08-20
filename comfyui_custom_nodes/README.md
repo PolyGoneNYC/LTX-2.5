@@ -33,8 +33,8 @@ See the file's own module docstring for the full technical rationale.
 ## `ltxv_voice_lock/` — LTXV Lock Character Voice
 
 A separate node package (its own folder, since it has heavy optional dependencies) that
-re-voices one enrolled character's speaking segments in a generated clip. See
-`ltxv_voice_lock/README.md` for install and usage.
+re-voices up to 4 enrolled characters' speaking segments in a generated clip, each to their own
+reference voice. See `ltxv_voice_lock/README.md` for install and usage.
 
 ## Ready-to-load example workflows
 
