@@ -192,6 +192,12 @@ def _revoice_segments_in_waveform(
 
     for i, (start_s, end_s) in enumerate(segments):
         start_i, end_i = int(start_s * sample_rate), int(end_s * sample_rate)
+        # Segment timing comes from Light-ASD's frame-based tracking, which can run a few
+        # samples past the actual audio buffer's length -- clamp so the write-back at the end
+        # always matches the real slice length instead of silently clipping.
+        end_i = min(end_i, audio.shape[1])
+        if end_i <= start_i:
+            continue
         segment_mono = audio[:, start_i:end_i].mean(axis=0) if num_channels > 1 else audio[0, start_i:end_i]
         seg_path = work_dir / f"segment_{i}.wav"
         sf.write(seg_path, segment_mono, sample_rate)
@@ -260,6 +266,12 @@ def _replace_segments_in_waveform(  # noqa: PLR0913
 
     for i, (start_s, end_s) in enumerate(segments):
         start_i, end_i = int(start_s * sample_rate), int(end_s * sample_rate)
+        # Segment timing comes from Light-ASD's frame-based tracking, which can run a few
+        # samples past the actual audio buffer's length -- clamp so the write-back at the end
+        # always matches the real slice length instead of silently clipping.
+        end_i = min(end_i, audio.shape[1])
+        if end_i <= start_i:
+            continue
         target_len = end_i - start_i
         segment = audio[:, start_i:end_i]  # [C, T_seg]
 
