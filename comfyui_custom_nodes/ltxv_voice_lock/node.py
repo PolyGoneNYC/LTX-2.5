@@ -227,6 +227,115 @@ def _revoice_segments_in_waveform(
     return audio
 
 
+def _replace_segments_in_waveform(  # noqa: PLR0913
+    waveform: np.ndarray,
+    sample_rate: int,
+    segments: list[tuple[float, float]],
+    separator,
+    whisper_model,
+    base_tts,
+    base_source_se,
+    converter,
+    target_se,
+    work_dir: Path,
+    tau: float,
+    crossfade_seconds: float = 0.08,
+) -> np.ndarray:
+    """Fully replace (not blend) each given segment's voice, keeping any background sound.
+
+    Per segment: separate vocals from background (Demucs), transcribe the isolated vocals
+    (faster-whisper), re-synthesize that text from scratch in the target voice (OpenVoice's own
+    base-speaker TTS, then its tone-color converter), time-fit the result to the segment's
+    original duration, and rebuild the segment as new-voice + original background. Unlike the
+    tone-color-only blend, nothing of the original voice recording survives into the output.
+    """
+    import soundfile as sf
+    import torchaudio
+    from librosa.effects import time_stretch
+
+    audio = waveform.astype(np.float64).copy()  # [C, T]
+    num_channels = audio.shape[0]
+    crossfade_n = int(crossfade_seconds * sample_rate)
+    demucs_sr = separator.samplerate
+
+    for i, (start_s, end_s) in enumerate(segments):
+        start_i, end_i = int(start_s * sample_rate), int(end_s * sample_rate)
+        target_len = end_i - start_i
+        segment = audio[:, start_i:end_i]  # [C, T_seg]
+
+        # 1. Separate vocals from background. Demucs is stereo-native; duplicate mono up front.
+        seg_tensor = torch.from_numpy(segment).float()
+        if num_channels == 1:
+            seg_tensor = seg_tensor.repeat(2, 1)
+        resampled_full, stems = separator.separate_tensor(seg_tensor, sr=sample_rate)
+        vocals = stems["vocals"]  # [2, T_demucs_sr]
+        background = resampled_full - vocals  # [2, T_demucs_sr]
+
+        background_native = torchaudio.functional.resample(background, demucs_sr, sample_rate)
+        if num_channels == 1:
+            background_native = background_native.mean(dim=0, keepdim=True)
+        background_native = background_native.cpu().numpy().astype(np.float64)
+        if background_native.shape[1] > target_len:
+            background_native = background_native[:, :target_len]
+        elif background_native.shape[1] < target_len:
+            pad = target_len - background_native.shape[1]
+            background_native = np.pad(background_native, ((0, 0), (0, pad)))
+
+        # 2. Transcribe the isolated vocals (faster-whisper wants 16kHz mono float32 when given
+        #    a raw array directly -- it does NOT resample arrays itself, only file paths).
+        vocals_mono = vocals.mean(dim=0)
+        vocals_16k = torchaudio.functional.resample(vocals_mono, demucs_sr, 16000).cpu().numpy().astype(np.float32)
+        whisper_segments, _info = whisper_model.transcribe(vocals_16k, language="en")
+        text = "".join(s.text for s in whisper_segments).strip()
+        if not text:
+            print(f"[LTXVLockCharacterVoice] segment {start_s:.2f}s-{end_s:.2f}s: nothing transcribed, leaving as-is")
+            continue
+
+        # 3. Generate brand-new speech from that text in the target voice: OpenVoice's own base
+        #    TTS, then the same tone-color converter used in blend mode, on top of the TTS output.
+        tts_path = work_dir / f"replace_{i}_tts.wav"
+        base_tts.tts(text, str(tts_path), speaker="default", language="English")
+        converted_path = work_dir / f"replace_{i}_converted.wav"
+        converter.convert(
+            audio_src_path=str(tts_path),
+            src_se=base_source_se,
+            tgt_se=target_se,
+            output_path=str(converted_path),
+            tau=tau,
+        )
+        converted, converted_sr = sf.read(str(converted_path))
+        converted = converted.astype(np.float32)
+        if converted_sr != sample_rate:
+            converted = torchaudio.functional.resample(torch.from_numpy(converted), converted_sr, sample_rate).numpy()
+
+        # 4. Time-fit the new speech to the segment's original duration (pitch-preserving).
+        if len(converted) > 0:
+            rate = len(converted) / target_len
+            rate = min(max(rate, 0.4), 2.5)  # avoid pathological stretching on extreme mismatches
+            converted = time_stretch(converted, rate=rate)
+        converted = converted.astype(np.float64)
+        if len(converted) > target_len:
+            converted = converted[:target_len]
+        elif len(converted) < target_len:
+            converted = np.pad(converted, (0, target_len - len(converted)))
+
+        # 5. Rebuild the segment: new voice on top of the original background, nothing of the
+        #    original voice recording left in it. Crossfade the edges against the ORIGINAL
+        #    segment audio so the cut in/out doesn't click.
+        new_segment = np.tile(converted, (num_channels, 1)) + background_native
+        n = min(crossfade_n, target_len // 2)
+        if n > 0:
+            fade_in = np.linspace(0, 1, n)
+            fade_out = 1 - fade_in
+            new_segment[:, :n] = new_segment[:, :n] * fade_in + segment[:, :n] * fade_out
+            new_segment[:, -n:] = new_segment[:, -n:] * fade_out + segment[:, -n:] * fade_in
+
+        audio[:, start_i:end_i] = new_segment
+        print(f'[LTXVLockCharacterVoice] replaced {start_s:.2f}s-{end_s:.2f}s: "{text}"')
+
+    return audio
+
+
 MAX_CHARACTERS = 4
 
 
@@ -256,6 +365,39 @@ class LTXVLockCharacterVoice:
                 "STRING",
                 {"default": "custom_nodes/ltxv_voice_lock/checkpoints/converter/checkpoint.pth"},
             ),
+            "mode": (
+                ["replace", "blend"],
+                {
+                    "default": "replace",
+                    "tooltip": (
+                        "replace: transcribes each segment and re-synthesizes it from scratch in the "
+                        "target voice, keeping background sound but replacing 100% of the original "
+                        "voice recording. Needs the base_speaker_*/whisper_model inputs below. "
+                        "blend: the original tone-color-only conversion -- keeps the original "
+                        "recording's delivery/rhythm and only shifts its timbre toward the target "
+                        "voice, so some of the original voice's character always comes through."
+                    ),
+                },
+            ),
+            "whisper_model": (
+                "STRING",
+                {
+                    "default": "base.en",
+                    "tooltip": "faster-whisper model size for transcribing segments in 'replace' mode.",
+                },
+            ),
+            "base_speaker_config": (
+                "STRING",
+                {"default": "custom_nodes/ltxv_voice_lock/checkpoints/base_speakers/EN/config.json"},
+            ),
+            "base_speaker_ckpt": (
+                "STRING",
+                {"default": "custom_nodes/ltxv_voice_lock/checkpoints/base_speakers/EN/checkpoint.pth"},
+            ),
+            "base_speaker_se": (
+                "STRING",
+                {"default": "custom_nodes/ltxv_voice_lock/checkpoints/base_speakers/EN/en_default_se.pth"},
+            ),
             "match_threshold": (
                 "FLOAT",
                 {"default": 0.35, "min": -1.0, "max": 1.0, "step": 0.01, "tooltip": "Applies to every character."},
@@ -284,14 +426,16 @@ class LTXVLockCharacterVoice:
     FUNCTION = "execute"
     CATEGORY = "audio/ltxv"
     DESCRIPTION = (
-        "Finds where each enrolled character (up to 4) is speaking (Light-ASD + InsightFace) and "
-        "re-voices just their segments to match their own reference voice sample (OpenVoice), "
-        "leaving every unenrolled character's dialogue untouched. Face detection runs once for the "
-        "whole video regardless of how many characters are enrolled. See this node package's "
-        "README.md before first use."
+        "Finds where each enrolled character (up to 4) is speaking (Light-ASD + InsightFace), "
+        "leaving every unenrolled character's dialogue untouched. 'replace' mode transcribes each "
+        "segment and re-synthesizes it from scratch in the reference voice, keeping background "
+        "sound but replacing the original voice entirely. 'blend' mode is the original tone-color-"
+        "only conversion, which keeps some of the original recording's delivery. Face detection "
+        "runs once for the whole video regardless of how many characters are enrolled. See this "
+        "node package's README.md before first use."
     )
 
-    def execute(  # noqa: PLR0913
+    def execute(  # noqa: PLR0912, PLR0913
         self,
         video,
         character_photo,
@@ -300,6 +444,11 @@ class LTXVLockCharacterVoice:
         light_asd_weight,
         converter_config,
         converter_ckpt,
+        mode,
+        whisper_model,
+        base_speaker_config,
+        base_speaker_ckpt,
+        base_speaker_se,
         match_threshold,
         speaking_threshold,
         min_segment_seconds,
@@ -364,6 +513,19 @@ class LTXVLockCharacterVoice:
         converter.watermark_model = None  # see voice_lock/lock_character_voice.py for why this
         converter.load_ckpt(converter_ckpt)
 
+        separator = whisper = base_tts = base_source_se = None
+        if mode == "replace":
+            from demucs.api import Separator
+            from faster_whisper import WhisperModel
+            from openvoice.api import BaseSpeakerTTS
+
+            print("[LTXVLockCharacterVoice] loading vocal-separation/transcription/TTS models for replace mode...")
+            separator = Separator(model="htdemucs", device=device)
+            whisper = WhisperModel(whisper_model, device="cuda" if "cuda" in device else "cpu")
+            base_tts = BaseSpeakerTTS(base_speaker_config, device=device)
+            base_tts.load_ckpt(base_speaker_ckpt)
+            base_source_se = torch.load(base_speaker_se, map_location=device)
+
         audio = components.audio
         sample_rate = int(audio["sample_rate"])  # audio is guaranteed non-None by the check above
         waveform = audio["waveform"][0].cpu().numpy()  # [C, T], original channel count preserved
@@ -387,12 +549,27 @@ class LTXVLockCharacterVoice:
             if not segments:
                 print(f"[LTXVLockCharacterVoice] character {i}: no speaking segments found -- skipping.")
                 continue
-            print(f"[LTXVLockCharacterVoice] character {i}: {len(segments)} segment(s) to re-voice")
+            print(f"[LTXVLockCharacterVoice] character {i}: {len(segments)} segment(s) to {mode}")
 
             target_se = converter.extract_se([str(voice_path)], se_save_path=None)
-            waveform = _revoice_segments_in_waveform(
-                waveform, sample_rate, segments, converter, target_se, work_dir, tau
-            )
+            if mode == "replace":
+                waveform = _replace_segments_in_waveform(
+                    waveform,
+                    sample_rate,
+                    segments,
+                    separator,
+                    whisper,
+                    base_tts,
+                    base_source_se,
+                    converter,
+                    target_se,
+                    work_dir,
+                    tau,
+                )
+            else:
+                waveform = _revoice_segments_in_waveform(
+                    waveform, sample_rate, segments, converter, target_se, work_dir, tau
+                )
             any_revoiced = True
 
         if not any_revoiced:
