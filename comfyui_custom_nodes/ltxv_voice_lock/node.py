@@ -521,7 +521,10 @@ class LTXVLockCharacterVoice:
 
             print("[LTXVLockCharacterVoice] loading vocal-separation/transcription/TTS models for replace mode...")
             separator = Separator(model="htdemucs", device=device)
-            whisper = WhisperModel(whisper_model, device="cuda" if "cuda" in device else "cpu")
+            # faster-whisper's CUDA backend (ctranslate2) needs CUDA 12.x runtime libs
+            # (libcublas.so.12 etc.) which aren't guaranteed present alongside newer CUDA
+            # stacks (e.g. cu13 torch builds) -- CPU is plenty fast for these small models.
+            whisper = WhisperModel(whisper_model, device="cpu")
             base_tts = BaseSpeakerTTS(base_speaker_config, device=device)
             base_tts.load_ckpt(base_speaker_ckpt)
             base_source_se = torch.load(base_speaker_se, map_location=device)
