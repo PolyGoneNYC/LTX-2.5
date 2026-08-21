@@ -233,7 +233,7 @@ def _revoice_segments_in_waveform(
     return audio
 
 
-def _replace_segments_in_waveform(  # noqa: PLR0913
+def _replace_segments_in_waveform(  # noqa: PLR0912, PLR0913
     waveform: np.ndarray,
     sample_rate: int,
     segments: list[tuple[float, float]],
@@ -305,8 +305,21 @@ def _replace_segments_in_waveform(  # noqa: PLR0913
 
         # 3. Generate brand-new speech from that text in the target voice: OpenVoice's own base
         #    TTS, then the same tone-color converter used in blend mode, on top of the TTS output.
+        #    Get the TTS itself close to the segment's duration first via its own native `speed`
+        #    parameter (the model actually pacing its delivery) rather than leaning on the
+        #    phase-vocoder stretch in step 4 to do all the work -- large phase-vocoder stretches
+        #    are what make replaced speech sound robotic/metallic, so minimizing how much
+        #    stretching is needed afterward is the main lever for more natural-sounding output.
         tts_path = work_dir / f"replace_{i}_tts.wav"
-        base_tts.tts(text, str(tts_path), speaker="default", language="English")
+        base_tts.tts(text, str(tts_path), speaker="default", language="English", speed=1.0)
+        probe, probe_sr = sf.read(str(tts_path))
+        target_duration = target_len / sample_rate
+        probe_duration = len(probe) / probe_sr if probe_sr else 0.0
+        if probe_duration > 0:
+            speed = probe_duration / target_duration
+            speed = min(max(speed, 0.7), 1.3)
+            if abs(speed - 1.0) > 0.03:
+                base_tts.tts(text, str(tts_path), speaker="default", language="English", speed=speed)
         converted_path = work_dir / f"replace_{i}_converted.wav"
         converter.convert(
             audio_src_path=str(tts_path),
@@ -320,11 +333,15 @@ def _replace_segments_in_waveform(  # noqa: PLR0913
         if converted_sr != sample_rate:
             converted = torchaudio.functional.resample(torch.from_numpy(converted), converted_sr, sample_rate).numpy()
 
-        # 4. Time-fit the new speech to the segment's original duration (pitch-preserving).
+        # 4. Time-fit the new speech to the segment's original duration (pitch-preserving). The
+        #    speed adjustment in step 3 should have already gotten close, so only phase-vocoder
+        #    stretch the small residual mismatch -- skip it entirely when close enough, since
+        #    stretching (even a little) is the main source of robotic-sounding artifacts.
         if len(converted) > 0:
             rate = len(converted) / target_len
-            rate = min(max(rate, 0.4), 2.5)  # avoid pathological stretching on extreme mismatches
-            converted = time_stretch(converted, rate=rate)
+            if abs(rate - 1.0) > 0.03:
+                rate = min(max(rate, 0.4), 2.5)  # avoid pathological stretching on extreme mismatches
+                converted = time_stretch(converted, rate=rate)
         converted = converted.astype(np.float64)
         if len(converted) > target_len:
             converted = converted[:target_len]
