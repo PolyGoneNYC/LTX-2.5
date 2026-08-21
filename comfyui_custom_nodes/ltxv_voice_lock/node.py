@@ -386,9 +386,21 @@ def _make_openvoice_synthesizer(base_tts, base_source_se, converter, target_se, 
 # needs, while cutting that cache allocation roughly 8x.
 _FISH_MAX_SEQ_LEN = 4096
 
+# launch_thread_safe_queue() (below) spawns a daemon thread that loads the Llama model onto
+# the GPU and loops forever processing requests -- it has no automatic shutdown, so calling
+# _load_fish_engine() fresh on every node execution leaks a whole new model + thread each run
+# (each is only reclaimed if the process exits). Cache by checkpoint identity so repeat runs
+# with the same checkpoints reuse the already-loaded engine instead of leaking another one.
+_FISH_ENGINE_CACHE: dict[tuple[str, str, str, str], object] = {}
+
 
 def _load_fish_engine(llama_checkpoint: str, decoder_checkpoint: str, decoder_config_name: str, device: str):
-    """Load Fish Audio's TTS inference engine (zero-shot voice cloning, single-pass)."""
+    """Load (or reuse a cached) Fish Audio TTS inference engine (zero-shot voice cloning, single-pass)."""
+    cache_key = (llama_checkpoint, decoder_checkpoint, decoder_config_name, device)
+    cached = _FISH_ENGINE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     from fish_speech.inference_engine import TTSInferenceEngine
     from fish_speech.models.dac.inference import load_model as load_fish_decoder_model
     from fish_speech.models.text2semantic.inference import launch_thread_safe_queue
@@ -410,7 +422,11 @@ def _load_fish_engine(llama_checkpoint: str, decoder_checkpoint: str, decoder_co
     decoder_model = load_fish_decoder_model(
         config_name=decoder_config_name, checkpoint_path=decoder_checkpoint, device=device
     )
-    return TTSInferenceEngine(llama_queue=llama_queue, decoder_model=decoder_model, precision=precision, compile=False)
+    engine = TTSInferenceEngine(
+        llama_queue=llama_queue, decoder_model=decoder_model, precision=precision, compile=False
+    )
+    _FISH_ENGINE_CACHE[cache_key] = engine
+    return engine
 
 
 def _make_fishaudio_synthesizer(engine, ref_audio_bytes: bytes, ref_text: str):
