@@ -585,6 +585,20 @@ class LTXVLockCharacterVoice:
         video_path = str(work_dir / "input.mp4")
         video.save_to(video_path)
 
+        # This node's models (InsightFace, Demucs, Fish Audio, etc.) are loaded with plain
+        # PyTorch, not through ComfyUI's own ModelPatcher/model-manager -- so ComfyUI has no way
+        # to know they need VRAM and won't auto-evict the (still-resident) video-generation
+        # models to make room. Free that memory ourselves before loading anything of our own;
+        # the video/audio content is already fully extracted into `components` above, so nothing
+        # downstream still needs those models loaded.
+        try:
+            from comfy import model_management
+
+            model_management.unload_all_models()
+            model_management.soft_empty_cache()
+        except ImportError:
+            pass
+
         print(f"[LTXVLockCharacterVoice] enrolling {len(characters)} character face embedding(s)...")
         face_app = FaceAnalysis(name="buffalo_l")
         face_app.prepare(ctx_id=0, det_size=(640, 640))
