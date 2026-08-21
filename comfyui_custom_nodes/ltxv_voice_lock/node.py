@@ -379,11 +379,29 @@ def _make_openvoice_synthesizer(base_tts, base_source_se, converter, target_se, 
     return synth
 
 
+# fish-speech sizes its KV cache for the model's own max_seq_len (commonly 32768, meant for
+# long-form use), which allocates several GB of VRAM regardless of how short the actual
+# request is. Every segment this node sends through is a few seconds at most, so clamp it
+# down -- still far more headroom than any realistic reference-clip + generated-segment length
+# needs, while cutting that cache allocation roughly 8x.
+_FISH_MAX_SEQ_LEN = 4096
+
+
 def _load_fish_engine(llama_checkpoint: str, decoder_checkpoint: str, decoder_config_name: str, device: str):
     """Load Fish Audio's TTS inference engine (zero-shot voice cloning, single-pass)."""
     from fish_speech.inference_engine import TTSInferenceEngine
     from fish_speech.models.dac.inference import load_model as load_fish_decoder_model
     from fish_speech.models.text2semantic.inference import launch_thread_safe_queue
+    from fish_speech.models.text2semantic.llama import DualARTransformer
+
+    if not getattr(DualARTransformer.setup_caches, "_ltxv_clamped", False):
+        original_setup_caches = DualARTransformer.setup_caches
+
+        def _clamped_setup_caches(self, max_batch_size, max_seq_len, dtype=torch.bfloat16):
+            return original_setup_caches(self, max_batch_size, min(max_seq_len, _FISH_MAX_SEQ_LEN), dtype)
+
+        _clamped_setup_caches._ltxv_clamped = True
+        DualARTransformer.setup_caches = _clamped_setup_caches
 
     precision = torch.bfloat16
     llama_queue = launch_thread_safe_queue(
@@ -591,6 +609,8 @@ class LTXVLockCharacterVoice:
         # models to make room. Free that memory ourselves before loading anything of our own;
         # the video/audio content is already fully extracted into `components` above, so nothing
         # downstream still needs those models loaded.
+        if torch.cuda.is_available():
+            before_gb = torch.cuda.memory_allocated() / 1e9
         try:
             from comfy import model_management
 
@@ -598,6 +618,12 @@ class LTXVLockCharacterVoice:
             model_management.soft_empty_cache()
         except ImportError:
             pass
+        if torch.cuda.is_available():
+            after_gb = torch.cuda.memory_allocated() / 1e9
+            print(
+                f"[LTXVLockCharacterVoice] GPU memory allocated before/after unload_all_models: "
+                f"{before_gb:.2f}GB -> {after_gb:.2f}GB"
+            )
 
         print(f"[LTXVLockCharacterVoice] enrolling {len(characters)} character face embedding(s)...")
         face_app = FaceAnalysis(name="buffalo_l")
