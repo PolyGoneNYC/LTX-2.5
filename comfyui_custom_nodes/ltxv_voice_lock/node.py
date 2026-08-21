@@ -19,6 +19,7 @@ research-repo dependencies that can conflict with what ComfyUI itself needs), an
 
 from __future__ import annotations
 
+import itertools
 import tempfile
 from pathlib import Path
 
@@ -233,29 +234,25 @@ def _revoice_segments_in_waveform(
     return audio
 
 
-def _replace_segments_in_waveform(  # noqa: PLR0912, PLR0913
+def _replace_segments_in_waveform(  # noqa: PLR0912
     waveform: np.ndarray,
     sample_rate: int,
     segments: list[tuple[float, float]],
     separator,
     whisper_model,
-    base_tts,
-    base_source_se,
-    converter,
-    target_se,
-    work_dir: Path,
-    tau: float,
+    synthesize_voice,
     crossfade_seconds: float = 0.08,
 ) -> np.ndarray:
     """Fully replace (not blend) each given segment's voice, keeping any background sound.
 
     Per segment: separate vocals from background (Demucs), transcribe the isolated vocals
-    (faster-whisper), re-synthesize that text from scratch in the target voice (OpenVoice's own
-    base-speaker TTS, then its tone-color converter), time-fit the result to the segment's
-    original duration, and rebuild the segment as new-voice + original background. Unlike the
-    tone-color-only blend, nothing of the original voice recording survives into the output.
+    (faster-whisper), re-synthesize that text from scratch in the target voice via the injected
+    `synthesize_voice(text, target_duration_seconds) -> (mono_audio, sample_rate)` backend (either
+    OpenVoice's base-speaker TTS + tone-color converter, or Fish Audio's direct zero-shot clone),
+    time-fit the result to the segment's original duration, and rebuild the segment as
+    new-voice + original background. Unlike the tone-color-only blend, nothing of the original
+    voice recording survives into the output.
     """
-    import soundfile as sf
     import torchaudio
     from librosa.effects import time_stretch
 
@@ -264,7 +261,7 @@ def _replace_segments_in_waveform(  # noqa: PLR0912, PLR0913
     crossfade_n = int(crossfade_seconds * sample_rate)
     demucs_sr = separator.samplerate
 
-    for i, (start_s, end_s) in enumerate(segments):
+    for start_s, end_s in segments:
         start_i, end_i = int(start_s * sample_rate), int(end_s * sample_rate)
         # Segment timing comes from Light-ASD's frame-based tracking, which can run a few
         # samples past the actual audio buffer's length -- clamp so the write-back at the end
@@ -303,33 +300,16 @@ def _replace_segments_in_waveform(  # noqa: PLR0912, PLR0913
             print(f"[LTXVLockCharacterVoice] segment {start_s:.2f}s-{end_s:.2f}s: nothing transcribed, leaving as-is")
             continue
 
-        # 3. Generate brand-new speech from that text in the target voice: OpenVoice's own base
-        #    TTS, then the same tone-color converter used in blend mode, on top of the TTS output.
-        #    Get the TTS itself close to the segment's duration first via its own native `speed`
-        #    parameter (the model actually pacing its delivery) rather than leaning on the
-        #    phase-vocoder stretch in step 4 to do all the work -- large phase-vocoder stretches
-        #    are what make replaced speech sound robotic/metallic, so minimizing how much
-        #    stretching is needed afterward is the main lever for more natural-sounding output.
-        tts_path = work_dir / f"replace_{i}_tts.wav"
-        base_tts.tts(text, str(tts_path), speaker="default", language="English", speed=1.0)
-        probe, probe_sr = sf.read(str(tts_path))
+        # 3. Generate brand-new speech from that text in the target voice via the injected
+        #    synthesis backend. The OpenVoice backend gets itself close to the segment's
+        #    duration first via its own native `speed` parameter (the model actually pacing its
+        #    delivery) rather than leaning on the phase-vocoder stretch in step 4 to do all the
+        #    work -- large phase-vocoder stretches are what make replaced speech sound
+        #    robotic/metallic, so minimizing how much stretching is needed afterward is the main
+        #    lever for more natural-sounding output.
         target_duration = target_len / sample_rate
-        probe_duration = len(probe) / probe_sr if probe_sr else 0.0
-        if probe_duration > 0:
-            speed = probe_duration / target_duration
-            speed = min(max(speed, 0.7), 1.3)
-            if abs(speed - 1.0) > 0.03:
-                base_tts.tts(text, str(tts_path), speaker="default", language="English", speed=speed)
-        converted_path = work_dir / f"replace_{i}_converted.wav"
-        converter.convert(
-            audio_src_path=str(tts_path),
-            src_se=base_source_se,
-            tgt_se=target_se,
-            output_path=str(converted_path),
-            tau=tau,
-        )
-        converted, converted_sr = sf.read(str(converted_path))
-        converted = converted.astype(np.float32)
+        converted, converted_sr = synthesize_voice(text, target_duration)
+        converted = np.asarray(converted, dtype=np.float32)
         if converted_sr != sample_rate:
             converted = torchaudio.functional.resample(torch.from_numpy(converted), converted_sr, sample_rate).numpy()
 
@@ -365,6 +345,79 @@ def _replace_segments_in_waveform(  # noqa: PLR0912, PLR0913
     return audio
 
 
+def _make_openvoice_synthesizer(base_tts, base_source_se, converter, target_se, tau, work_dir: Path):
+    """Build a synthesize_voice(text, target_duration_s) backend using OpenVoice's own
+    base-speaker TTS (to generate the words) followed by its tone-color converter (to shift
+    the timbre toward the target voice). Returns (mono_audio, sample_rate).
+    """
+    import soundfile as sf
+
+    counter = itertools.count()
+
+    def synth(text: str, target_duration_s: float) -> tuple[np.ndarray, int]:
+        i = next(counter)
+        tts_path = work_dir / f"openvoice_{i}_tts.wav"
+        base_tts.tts(text, str(tts_path), speaker="default", language="English", speed=1.0)
+        probe, probe_sr = sf.read(str(tts_path))
+        probe_duration = len(probe) / probe_sr if probe_sr else 0.0
+        if probe_duration > 0 and target_duration_s > 0:
+            speed = probe_duration / target_duration_s
+            speed = min(max(speed, 0.7), 1.3)
+            if abs(speed - 1.0) > 0.03:
+                base_tts.tts(text, str(tts_path), speaker="default", language="English", speed=speed)
+        converted_path = work_dir / f"openvoice_{i}_converted.wav"
+        converter.convert(
+            audio_src_path=str(tts_path),
+            src_se=base_source_se,
+            tgt_se=target_se,
+            output_path=str(converted_path),
+            tau=tau,
+        )
+        converted, converted_sr = sf.read(str(converted_path))
+        return converted.astype(np.float32), converted_sr
+
+    return synth
+
+
+def _load_fish_engine(llama_checkpoint: str, decoder_checkpoint: str, decoder_config_name: str, device: str):
+    """Load Fish Audio's TTS inference engine (zero-shot voice cloning, single-pass)."""
+    from fish_speech.inference_engine import TTSInferenceEngine
+    from fish_speech.models.dac.inference import load_model as load_fish_decoder_model
+    from fish_speech.models.text2semantic.inference import launch_thread_safe_queue
+
+    precision = torch.bfloat16
+    llama_queue = launch_thread_safe_queue(
+        checkpoint_path=llama_checkpoint, device=device, precision=precision, compile=False
+    )
+    decoder_model = load_fish_decoder_model(
+        config_name=decoder_config_name, checkpoint_path=decoder_checkpoint, device=device
+    )
+    return TTSInferenceEngine(llama_queue=llama_queue, decoder_model=decoder_model, precision=precision, compile=False)
+
+
+def _make_fishaudio_synthesizer(engine, ref_audio_bytes: bytes, ref_text: str):
+    """Build a synthesize_voice(text, target_duration_s) backend using Fish Audio's direct
+    zero-shot voice cloning (reference audio + its transcript, in one pass -- no separate
+    tone-color conversion step). Returns (mono_audio, sample_rate).
+    """
+    from fish_speech.utils.schema import ServeReferenceAudio, ServeTTSRequest
+
+    def synth(text: str, target_duration_s: float) -> tuple[np.ndarray, int]:  # noqa: ARG001
+        req = ServeTTSRequest(
+            text=text,
+            references=[ServeReferenceAudio(audio=ref_audio_bytes, text=ref_text)],
+        )
+        for result in engine.inference(req):
+            if result.code == "error":
+                raise RuntimeError(str(result.error))
+            if result.code == "final":
+                sr, audio_np = result.audio
+                return np.asarray(audio_np, dtype=np.float32), sr
+        raise RuntimeError("Fish Audio produced no audio output")
+
+    return synth
+
+
 MAX_CHARACTERS = 4
 
 
@@ -395,13 +448,17 @@ class LTXVLockCharacterVoice:
                 {"default": "custom_nodes/ltxv_voice_lock/checkpoints/converter/checkpoint.pth"},
             ),
             "mode": (
-                ["replace", "blend"],
+                ["replace_fishaudio", "replace", "blend"],
                 {
-                    "default": "replace",
+                    "default": "replace_fishaudio",
                     "tooltip": (
-                        "replace: transcribes each segment and re-synthesizes it from scratch in the "
-                        "target voice, keeping background sound but replacing 100% of the original "
-                        "voice recording. Needs the base_speaker_*/whisper_model inputs below. "
+                        "replace_fishaudio: transcribes each segment and re-synthesizes it from scratch "
+                        "using Fish Audio's zero-shot voice cloning (reference clip + text, one pass), "
+                        "keeping background sound but replacing 100% of the original voice recording. "
+                        "The most natural-sounding option. Needs the fish_*/whisper_model inputs below. "
+                        "replace: same idea, but using OpenVoice's base-speaker TTS + tone-color "
+                        "converter instead -- kept as a fallback; tends to sound more robotic. Needs the "
+                        "base_speaker_*/whisper_model inputs below. "
                         "blend: the original tone-color-only conversion -- keeps the original "
                         "recording's delivery/rhythm and only shifts its timbre toward the target "
                         "voice, so some of the original voice's character always comes through."
@@ -412,7 +469,7 @@ class LTXVLockCharacterVoice:
                 "STRING",
                 {
                     "default": "base.en",
-                    "tooltip": "faster-whisper model size for transcribing segments in 'replace' mode.",
+                    "tooltip": "faster-whisper model size for transcribing segments in either replace mode.",
                 },
             ),
             "base_speaker_config": (
@@ -427,6 +484,18 @@ class LTXVLockCharacterVoice:
                 "STRING",
                 {"default": "custom_nodes/ltxv_voice_lock/checkpoints/base_speakers/EN/en_default_se.pth"},
             ),
+            "fish_llama_checkpoint": (
+                "STRING",
+                {
+                    "default": "custom_nodes/ltxv_voice_lock/checkpoints/fish_s2pro",
+                    "tooltip": "Directory containing Fish Audio's semantic-token model weights.",
+                },
+            ),
+            "fish_decoder_checkpoint": (
+                "STRING",
+                {"default": "custom_nodes/ltxv_voice_lock/checkpoints/fish_s2pro/codec.pth"},
+            ),
+            "fish_decoder_config_name": ("STRING", {"default": "modded_dac_vq"}),
             "match_threshold": (
                 "FLOAT",
                 {"default": 0.35, "min": -1.0, "max": 1.0, "step": 0.01, "tooltip": "Applies to every character."},
@@ -456,12 +525,14 @@ class LTXVLockCharacterVoice:
     CATEGORY = "audio/ltxv"
     DESCRIPTION = (
         "Finds where each enrolled character (up to 4) is speaking (Light-ASD + InsightFace), "
-        "leaving every unenrolled character's dialogue untouched. 'replace' mode transcribes each "
-        "segment and re-synthesizes it from scratch in the reference voice, keeping background "
-        "sound but replacing the original voice entirely. 'blend' mode is the original tone-color-"
-        "only conversion, which keeps some of the original recording's delivery. Face detection "
-        "runs once for the whole video regardless of how many characters are enrolled. See this "
-        "node package's README.md before first use."
+        "leaving every unenrolled character's dialogue untouched. 'replace_fishaudio' and "
+        "'replace' modes both transcribe each segment and re-synthesize it from scratch in the "
+        "reference voice, keeping background sound but replacing the original voice entirely -- "
+        "they only differ in which TTS/cloning engine generates the new speech (Fish Audio's "
+        "direct zero-shot clone vs. OpenVoice's base-speaker TTS + tone-color converter). 'blend' "
+        "mode is the original tone-color-only conversion, which keeps some of the original "
+        "recording's delivery. Face detection runs once for the whole video regardless of how "
+        "many characters are enrolled. See this node package's README.md before first use."
     )
 
     def execute(  # noqa: PLR0912, PLR0913
@@ -478,6 +549,9 @@ class LTXVLockCharacterVoice:
         base_speaker_config,
         base_speaker_ckpt,
         base_speaker_se,
+        fish_llama_checkpoint,
+        fish_decoder_checkpoint,
+        fish_decoder_config_name,
         match_threshold,
         speaking_threshold,
         min_segment_seconds,
@@ -538,25 +612,35 @@ class LTXVLockCharacterVoice:
         tracks, scores = _run_light_asd(video_path, light_asd_repo, light_asd_weight, work_dir)
         print(f"[LTXVLockCharacterVoice] found {len(tracks)} face track(s)")
 
-        converter = ToneColorConverter(converter_config, device=device)
-        converter.watermark_model = None  # see voice_lock/lock_character_voice.py for why this
-        converter.load_ckpt(converter_ckpt)
+        converter = None
+        if mode != "replace_fishaudio":
+            converter = ToneColorConverter(converter_config, device=device)
+            converter.watermark_model = None  # see voice_lock/lock_character_voice.py for why this
+            converter.load_ckpt(converter_ckpt)
 
-        separator = whisper = base_tts = base_source_se = None
-        if mode == "replace":
+        separator = whisper = base_tts = base_source_se = fish_engine = None
+        if mode in ("replace", "replace_fishaudio"):
             from demucs.api import Separator
             from faster_whisper import WhisperModel
-            from openvoice.api import BaseSpeakerTTS
 
-            print("[LTXVLockCharacterVoice] loading vocal-separation/transcription/TTS models for replace mode...")
+            print(f"[LTXVLockCharacterVoice] loading vocal-separation/transcription models for {mode} mode...")
             separator = Separator(model="htdemucs", device=device)
             # faster-whisper's CUDA backend (ctranslate2) needs CUDA 12.x runtime libs
             # (libcublas.so.12 etc.) which aren't guaranteed present alongside newer CUDA
             # stacks (e.g. cu13 torch builds) -- CPU is plenty fast for these small models.
             whisper = WhisperModel(whisper_model, device="cpu")
+
+        if mode == "replace":
+            from openvoice.api import BaseSpeakerTTS
+
             base_tts = BaseSpeakerTTS(base_speaker_config, device=device)
             base_tts.load_ckpt(base_speaker_ckpt)
             base_source_se = torch.load(base_speaker_se, map_location=device)
+        elif mode == "replace_fishaudio":
+            print("[LTXVLockCharacterVoice] loading Fish Audio voice-cloning engine...")
+            fish_engine = _load_fish_engine(
+                fish_llama_checkpoint, fish_decoder_checkpoint, fish_decoder_config_name, device
+            )
 
         audio = components.audio
         sample_rate = int(audio["sample_rate"])  # audio is guaranteed non-None by the check above
@@ -583,22 +667,17 @@ class LTXVLockCharacterVoice:
                 continue
             print(f"[LTXVLockCharacterVoice] character {i}: {len(segments)} segment(s) to {mode}")
 
-            target_se = converter.extract_se([str(voice_path)], se_save_path=None)
-            if mode == "replace":
-                waveform = _replace_segments_in_waveform(
-                    waveform,
-                    sample_rate,
-                    segments,
-                    separator,
-                    whisper,
-                    base_tts,
-                    base_source_se,
-                    converter,
-                    target_se,
-                    work_dir,
-                    tau,
-                )
+            if mode == "replace_fishaudio":
+                ref_segments, _ = whisper.transcribe(str(voice_path), language="en")
+                ref_text = "".join(s.text for s in ref_segments).strip()
+                synth = _make_fishaudio_synthesizer(fish_engine, voice_path.read_bytes(), ref_text)
+                waveform = _replace_segments_in_waveform(waveform, sample_rate, segments, separator, whisper, synth)
+            elif mode == "replace":
+                target_se = converter.extract_se([str(voice_path)], se_save_path=None)
+                synth = _make_openvoice_synthesizer(base_tts, base_source_se, converter, target_se, tau, work_dir)
+                waveform = _replace_segments_in_waveform(waveform, sample_rate, segments, separator, whisper, synth)
             else:
+                target_se = converter.extract_se([str(voice_path)], se_save_path=None)
                 waveform = _revoice_segments_in_waveform(
                     waveform, sample_rate, segments, converter, target_se, work_dir, tau
                 )
