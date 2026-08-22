@@ -122,16 +122,23 @@ def _identify_character_track(
         frame_ids = track["track"]["frame"]
         sample_positions = np.linspace(0, len(frame_ids) - 1, num=min(5, len(frame_ids)), dtype=int)
         similarities = []
+        empty_crops = no_faces = 0
         for pos in sample_positions:
             crop = _crop_face_at_frame(video_path, frame_ids[pos], track, pos)
             if crop.size == 0:
+                empty_crops += 1
                 continue
             faces = face_app.get(crop)
             if not faces:
+                no_faces += 1
                 continue
             largest = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
             similarities.append(float(np.dot(largest.normed_embedding, target_embedding)))
         if not similarities:
+            print(
+                f"[LTXVLockCharacterVoice] track {track_idx}: no usable face crop in "
+                f"{len(sample_positions)} sample(s) (empty_crop={empty_crops}, no_face_detected={no_faces})"
+            )
             continue
         track_score = float(np.median(similarities))
         print(f"[LTXVLockCharacterVoice] track {track_idx}: identity similarity = {track_score:.3f}")
