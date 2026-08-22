@@ -508,7 +508,13 @@ def _make_omnivoice_synthesizer(model, ref_audio_path: str, ref_text: str):
     prompt = model.create_voice_clone_prompt(ref_audio_path, ref_text=ref_text)
 
     def synth(text: str, target_duration_s: float) -> tuple[np.ndarray, int]:
-        audios = model.generate(text=text, voice_clone_prompt=prompt, duration=target_duration_s)
+        # OmniVoiceGenerationConfig defaults to pad_duration=0.1 -- postprocess_output adds that
+        # much silence to BOTH ends of every generated clip. Since we already fix the segment's
+        # total duration via `duration=`, that padding just eats into it and pushes the actual
+        # speech onset later than the original speaker's -- audible as a sync lag (mouth moves,
+        # silence, then the voice starts). Zero it out; postprocess_output's own silence-removal
+        # and fade-in/out still run, just without adding new silence back on top.
+        audios = model.generate(text=text, voice_clone_prompt=prompt, duration=target_duration_s, pad_duration=0.0)
         return np.asarray(audios[0], dtype=np.float32), model.sampling_rate
 
     return synth
