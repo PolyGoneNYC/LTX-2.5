@@ -1,4 +1,4 @@
-"""ComfyUI node: re-voice up to 4 enrolled characters' speaking segments in a generated video.
+"""ComfyUI node: re-voice enrolled characters' speaking segments in a generated video.
 
 Runs entirely inside the ComfyUI graph -- no separate script, no output file to hand back in.
 Wire it in right after wherever your workflow produces a VIDEO (e.g. the LTX-2.5 subgraph's
@@ -140,10 +140,6 @@ def _identify_character_track(
                 empty_crops += 1
                 continue
             faces = face_app.get(crop)
-            print(f"[LTXVLockCharacterVoice] track {track_idx} sample {pos}: crop shape = {crop.shape}")
-            debug_dir = Path("/tmp/ltxv_voice_lock_debug")
-            debug_dir.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(debug_dir / f"track{track_idx}_sample{pos}.jpg"), crop)
             if not faces:
                 no_faces += 1
                 continue
@@ -578,14 +574,51 @@ def _make_omnivoice_synthesizer(model, ref_audio_path: str, ref_text: str):
 
 MAX_CHARACTERS = 4
 
+# A character library on disk, so recurring characters don't have to be re-wired into the
+# graph for every shot. Layout:
+#     characters/
+#       cleopatra/  face.jpg   voice.wav
+#       guard/      face.png   voice.mp3
+# One sub-directory per character; the directory name is the character's name. The first
+# image file is the reference face, the first audio file is the reference voice.
+_FACE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+_VOICE_SUFFIXES = (".wav", ".mp3", ".flac", ".ogg", ".m4a")
+
+
+def _scan_character_folder(folder: str) -> list[tuple[str, Path, Path]]:
+    """Return (name, face_path, voice_path) for every usable character sub-directory.
+
+    Directories missing a face or a voice are reported and skipped rather than failing the
+    whole run -- a half-populated library should still re-voice the characters it can.
+    """
+    root = Path(folder).expanduser()
+    if not root.is_dir():
+        print(f"[LTXVLockCharacterVoice] character_folder '{root}' is not a directory -- ignoring.")
+        return []
+
+    found = []
+    for sub in sorted(p for p in root.iterdir() if p.is_dir()):
+        files = sorted(p for p in sub.iterdir() if p.is_file())
+        face = next((p for p in files if p.suffix.lower() in _FACE_SUFFIXES), None)
+        voice = next((p for p in files if p.suffix.lower() in _VOICE_SUFFIXES), None)
+        if face is None or voice is None:
+            missing = "face image" if face is None else "voice clip"
+            print(f"[LTXVLockCharacterVoice] character '{sub.name}': no {missing} found -- skipping.")
+            continue
+        found.append((sub.name, face, voice))
+
+    if found:
+        print(f"[LTXVLockCharacterVoice] character library: {', '.join(n for n, _, _ in found)}")
+    else:
+        print(f"[LTXVLockCharacterVoice] no usable characters found in '{root}'.")
+    return found
+
 
 class LTXVLockCharacterVoice:
     @classmethod
     def INPUT_TYPES(cls):
         required = {
             "video": ("VIDEO",),
-            "character_photo": ("IMAGE", {"tooltip": "Character 1's reference face photo."}),
-            "character_voice": ("AUDIO", {"tooltip": "Character 1's ~5-10s reference voice clip."}),
             "light_asd_repo": ("STRING", {"default": "custom_nodes/ltxv_voice_lock/third_party/Light-ASD"}),
             "light_asd_weight": (
                 "STRING",
@@ -685,19 +718,42 @@ class LTXVLockCharacterVoice:
                 {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Applies to every character."},
             ),
             "device": ("STRING", {"default": "cuda:0"}),
+            # Appended LAST on purpose: widgets_values in a saved workflow is a positional
+            # array, so adding a widget anywhere but the end shifts every later value.
+            "character_folder": (
+                "STRING",
+                {
+                    "default": "",
+                    "tooltip": (
+                        "Optional character library. One sub-folder per character, each holding a "
+                        "face image and a voice clip -- e.g. characters/cleopatra/face.jpg + voice.wav. "
+                        "The folder name is the character name. Characters found here are enrolled "
+                        "alongside any wired directly into the photo/voice inputs. Leave empty to "
+                        "use only the wired inputs."
+                    ),
+                },
+            ),
         }
-        optional = {}
+        optional = {
+            # Optional so the node can run from character_folder alone.
+            "character_photo": ("IMAGE", {"tooltip": "Character 1's reference face photo."}),
+            "character_voice": ("AUDIO", {"tooltip": "Character 1's ~5-10s reference voice clip."}),
+        }
         for i in range(2, MAX_CHARACTERS + 1):
             optional[f"character_photo_{i}"] = ("IMAGE", {"tooltip": f"Character {i}'s reference face photo."})
             optional[f"character_voice_{i}"] = ("AUDIO", {"tooltip": f"Character {i}'s reference voice clip."})
         return {"required": required, "optional": optional}
 
-    RETURN_TYPES = ("VIDEO",)
+    RETURN_TYPES = ("VIDEO", "AUDIO")
+    RETURN_NAMES = ("video", "audio")
     FUNCTION = "execute"
     CATEGORY = "audio/ltxv"
     DESCRIPTION = (
-        "Finds where each enrolled character (up to 4) is speaking (Light-ASD + InsightFace), "
-        "leaving every unenrolled character's dialogue untouched. 'replace_omnivoice', "
+        "Finds where each enrolled character is speaking (Light-ASD + InsightFace), leaving "
+        "every unenrolled character's dialogue untouched. Characters come from the "
+        "character_folder library on disk and/or up to 4 photo+voice pairs wired directly. "
+        "Outputs both the re-voiced VIDEO and the new AUDIO on its own, so the audio can be fed "
+        "to a lip-sync node to redraw the mouths to match the new voice. 'replace_omnivoice', "
         "'replace_fishaudio', and 'replace' modes all transcribe each segment and re-synthesize "
         "it from scratch in the reference voice, keeping background sound but replacing the "
         "original voice entirely -- they only differ in which TTS/cloning engine generates the "
@@ -711,8 +767,6 @@ class LTXVLockCharacterVoice:
     def execute(  # noqa: PLR0912, PLR0913
         self,
         video,
-        character_photo,
-        character_voice,
         light_asd_repo,
         light_asd_weight,
         converter_config,
@@ -731,6 +785,9 @@ class LTXVLockCharacterVoice:
         min_segment_seconds,
         tau,
         device,
+        character_folder="",
+        character_photo=None,
+        character_voice=None,
         character_photo_2=None,
         character_voice_2=None,
         character_photo_3=None,
@@ -741,20 +798,42 @@ class LTXVLockCharacterVoice:
         from insightface.app import FaceAnalysis
         from openvoice.api import ToneColorConverter
 
-        characters = [(character_photo, character_voice)]
-        for photo, voice in (
-            (character_photo_2, character_voice_2),
-            (character_photo_3, character_voice_3),
-            (character_photo_4, character_voice_4),
-        ):
-            if photo is not None and voice is not None:
-                characters.append((photo, voice))
+        wired = [
+            (photo, voice)
+            for photo, voice in (
+                (character_photo, character_voice),
+                (character_photo_2, character_voice_2),
+                (character_photo_3, character_voice_3),
+                (character_photo_4, character_voice_4),
+            )
+            if photo is not None and voice is not None
+        ]
 
         work_dir = Path(tempfile.mkdtemp(prefix="ltxv_voice_lock_"))
         components = video.get_components()
         if components.audio is None:
             print("[LTXVLockCharacterVoice] video has no audio track -- passing video through unchanged.")
-            return (video,)
+            return (video, components.audio)
+
+        # Normalize both sources to (name, face_path, voice_path). Wired IMAGE/AUDIO inputs are
+        # written to the work dir first; library characters are already files on disk.
+        character_sources: list[tuple[str, Path, Path]] = []
+        for i, (photo, voice) in enumerate(wired, start=1):
+            photo_path = work_dir / f"character_{i}.jpg"
+            _save_photo(photo, photo_path)
+            voice_path = work_dir / f"character_{i}_voice.wav"
+            _save_voice(voice, voice_path)
+            character_sources.append((f"character {i}", photo_path, voice_path))
+
+        if character_folder.strip():
+            character_sources.extend(_scan_character_folder(character_folder.strip()))
+
+        if not character_sources:
+            print(
+                "[LTXVLockCharacterVoice] no characters given -- wire a photo+voice pair or set "
+                "character_folder. Passing video through unchanged."
+            )
+            return (video, components.audio)
 
         video_path = str(work_dir / "input.mp4")
         video.save_to(video_path)
@@ -782,28 +861,26 @@ class LTXVLockCharacterVoice:
                 f"{before_gb:.2f}GB -> {after_gb:.2f}GB"
             )
 
-        print(f"[LTXVLockCharacterVoice] enrolling {len(characters)} character face embedding(s)...")
+        print(f"[LTXVLockCharacterVoice] enrolling {len(character_sources)} character face embedding(s)...")
         face_app = FaceAnalysis(name="buffalo_l")
         face_app.prepare(ctx_id=0, det_size=(640, 640))
 
-        enrolled = []  # list of (character_number, target_embedding, voice_path)
-        for i, (photo, voice) in enumerate(characters, start=1):
-            photo_path = work_dir / f"character_{i}.jpg"
-            _save_photo(photo, photo_path)
-            voice_path = work_dir / f"character_{i}_voice.wav"
-            _save_voice(voice, voice_path)
-
+        enrolled = []  # list of (character_name, target_embedding, voice_path)
+        for name, photo_path, voice_path in character_sources:
             photo_img = cv2.imread(str(photo_path))
+            if photo_img is None:
+                print(f"[LTXVLockCharacterVoice] {name}: could not read '{photo_path}' -- skipping.")
+                continue
             faces = face_app.get(photo_img)
             if not faces:
-                print(f"[LTXVLockCharacterVoice] character {i}: no face detected in photo -- skipping.")
+                print(f"[LTXVLockCharacterVoice] {name}: no face detected in photo -- skipping.")
                 continue
             largest = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-            enrolled.append((i, largest.normed_embedding, voice_path))
+            enrolled.append((name, largest.normed_embedding, voice_path))
 
         if not enrolled:
             print("[LTXVLockCharacterVoice] no character faces enrolled -- passing video through unchanged.")
-            return (video,)
+            return (video, components.audio)
 
         print("[LTXVLockCharacterVoice] running Light-ASD...")
         tracks, scores = _run_light_asd(video_path, light_asd_repo, light_asd_weight, work_dir)
@@ -852,26 +929,26 @@ class LTXVLockCharacterVoice:
 
         claimed_tracks: set[int] = set()
         any_revoiced = False
-        for i, target_embedding, voice_path in enrolled:
+        for name, target_embedding, voice_path in enrolled:
             track_idx, match_score = _identify_character_track(
                 video_path, tracks, face_app, target_embedding, match_threshold, video_fps, exclude=claimed_tracks
             )
             if track_idx is None:
                 print(
-                    f"[LTXVLockCharacterVoice] character {i}: no track matched above threshold "
+                    f"[LTXVLockCharacterVoice] {name}: no track matched above threshold "
                     f"{match_threshold} (best: {match_score:.3f}) -- skipping."
                 )
                 continue
             claimed_tracks.add(track_idx)
-            print(f"[LTXVLockCharacterVoice] character {i}: matched track {track_idx} (similarity {match_score:.3f})")
+            print(f"[LTXVLockCharacterVoice] {name}: matched track {track_idx} (similarity {match_score:.3f})")
 
             segments = _speaking_segments(
                 tracks[track_idx], scores[track_idx], speaking_threshold, min_segment_seconds, video_fps
             )
             if not segments:
-                print(f"[LTXVLockCharacterVoice] character {i}: no speaking segments found -- skipping.")
+                print(f"[LTXVLockCharacterVoice] {name}: no speaking segments found -- skipping.")
                 continue
-            print(f"[LTXVLockCharacterVoice] character {i}: {len(segments)} segment(s) to {mode}")
+            print(f"[LTXVLockCharacterVoice] {name}: {len(segments)} segment(s) to {mode}")
 
             if mode == "replace_omnivoice":
                 ref_segments, _ = whisper.transcribe(str(voice_path), language="en")
@@ -896,7 +973,7 @@ class LTXVLockCharacterVoice:
 
         if not any_revoiced:
             print("[LTXVLockCharacterVoice] nothing re-voiced -- passing video through unchanged.")
-            return (video,)
+            return (video, components.audio)
 
         new_audio = {
             "waveform": torch.from_numpy(waveform.astype(np.float32)).unsqueeze(0),
@@ -909,7 +986,7 @@ class LTXVLockCharacterVoice:
             Types.VideoComponents(images=components.images, audio=new_audio, frame_rate=components.frame_rate)
         )
         print("[LTXVLockCharacterVoice] done.")
-        return (new_video,)
+        return (new_video, new_audio)
 
 
 NODE_CLASS_MAPPINGS = {"LTXVLockCharacterVoice": LTXVLockCharacterVoice}

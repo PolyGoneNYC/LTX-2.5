@@ -3,9 +3,16 @@
 Runs the same idea as `voice_lock/` at the repo root, but as an actual node inside your ComfyUI
 graph instead of a separate terminal command: wire it in right after wherever your workflow
 produces a `VIDEO` (e.g. the LTX-2.5 subgraph's output) and before `SaveVideo`, and it re-voices
-just the segments where each enrolled character is speaking (up to 4 characters in one node),
-leaving everyone else's dialogue untouched. Face detection/tracking runs once per video no matter
-how many characters are enrolled.
+just the segments where each enrolled character is speaking, leaving everyone else's dialogue
+untouched. Face detection/tracking runs once per video no matter how many characters are enrolled.
+
+Characters come from either (or both) of two places: a **character library folder** on disk
+(`character_folder`), so recurring characters don't have to be re-wired for every shot, and up to
+4 photo+voice pairs wired directly into the node's `IMAGE`/`AUDIO` inputs.
+
+The node outputs the re-voiced `VIDEO` **and** the new `AUDIO` on its own. That second output is
+there so the new voice can be fed to a lip-sync node, which redraws each mouth to match it — see
+[Lip-sync: making the mouths match](#lip-sync-making-the-mouths-match) below.
 
 ## Install
 
@@ -135,9 +142,10 @@ code is MIT). See `voice_lock/README.md` for the same note in more detail.
 | Input | Type | What it is |
 |---|---|---|
 | `video` | VIDEO | Your generated clip, wherever your workflow produces it. |
-| `character_photo` | IMAGE | Character 1's reference face photo (from a `Load Image` node). Required. |
-| `character_voice` | AUDIO | Character 1's ~5-10s reference voice clip (from a `LoadAudio` node). Required. |
-| `character_photo_2` / `character_voice_2` (and `_3`, `_4`) | IMAGE / AUDIO | Optional additional characters — up to 4 total in one node. Leave unconnected if you only need one. |
+| `character_folder` | STRING | Path to a character library on disk (see below). Leave empty to use only the wired inputs. |
+| `character_photo` | IMAGE | Optional. Character 1's reference face photo (from a `Load Image` node). |
+| `character_voice` | AUDIO | Optional. Character 1's ~5-10s reference voice clip (from a `LoadAudio` node). |
+| `character_photo_2` / `character_voice_2` (and `_3`, `_4`) | IMAGE / AUDIO | Optional additional wired characters — up to 4 pairs. Leave unconnected if you only need one, or none at all if you're using `character_folder`. |
 | `light_asd_repo` / `light_asd_weight` | STRING | Paths from step 3 above. |
 | `converter_config` / `converter_ckpt` | STRING | Paths from step 4 above. Only used in `replace` and `blend` modes. |
 | `mode` | COMBO | `replace_omnivoice` (default), `replace_fishaudio`, `replace`, or `blend`. See below. |
@@ -147,11 +155,43 @@ code is MIT). See `voice_lock/README.md` for the same note in more detail.
 | `omnivoice_model_path` | STRING | Local directory or HF Hub repo id from step 6 above (default `k2-fsa/OmniVoice`). Only used in `replace_omnivoice` mode. |
 | `match_threshold` | FLOAT | Min face-identity similarity to accept a match (default 0.35). Applies to every character. |
 | `speaking_threshold` | FLOAT | Min Light-ASD score to count as "speaking" (default 0.0). Applies to every character. |
+| `min_segment_seconds` | FLOAT | Speaking segments shorter than this are ignored (default 0.4). |
+| `device` | STRING | Torch device for the conversion/cloning models (default `cuda:0`). |
 | `tau` | FLOAT | OpenVoice conversion strength (default 0.3). Only used in `replace` and `blend` modes -- neither OmniVoice's nor Fish Audio's clone has an equivalent knob. |
 
 Each enrolled character is matched to its own best-scoring face track (a track already claimed by
 an earlier character can't also be claimed by a later one, so two people can't accidentally get
 merged into the same re-voiced segments).
+
+### The character library (`character_folder`)
+
+Point `character_folder` at a directory laid out with one sub-directory per character:
+
+```
+characters/
+  cleopatra/
+    face.jpg
+    voice.wav
+  guard/
+    face.png
+    voice.mp3
+```
+
+The sub-directory **name is the character's name** (it's what shows up in the console log). Inside
+each one, the first image file (`.jpg` `.jpeg` `.png` `.webp` `.bmp`) is the reference face and the
+first audio file (`.wav` `.mp3` `.flac` `.ogg` `.m4a`) is the reference voice. Order is
+alphabetical, so if you keep several images in a folder, name the one you want `face.jpg` or
+similar so it sorts first.
+
+Every character in the library is enrolled on every run: the node scans them all, computes a face
+embedding for each, and matches each against the face tracks it found in the video. Characters who
+aren't in this particular shot simply don't match anything and are skipped with a console line
+saying so — there's no cost to keeping a large library. A sub-directory missing either a face or a
+voice is reported and skipped rather than failing the run.
+
+The library is unbounded; only the *wired* `character_photo`/`character_voice` inputs are capped at
+4 (that's a limit of how many input sockets the node exposes, not of the matching itself).
+Characters from both sources are enrolled together.
 
 ### `replace_omnivoice` vs `replace_fishaudio` vs `replace` vs `blend` mode
 
@@ -188,8 +228,47 @@ chain several models instead of one), and depend on the transcription being accu
 faster-whisper mishears a line, the resynthesized speech will say the wrong thing. Check the
 console output, which prints the transcribed text for every segment it replaces.
 
-Output: `video` (VIDEO) — same clip, with each matched character's speaking segments re-voiced to
-their own reference voice. Wire this into `SaveVideo` in place of your original video output.
+Outputs:
+
+- `video` (VIDEO) — same clip, with each matched character's speaking segments re-voiced to their
+  own reference voice. Wire this into `SaveVideo` in place of your original video output.
+- `audio` (AUDIO) — the new soundtrack on its own (re-voiced speech plus the original background).
+  Feed this to a lip-sync node together with the video; see below.
+
+## Lip-sync: making the mouths match
+
+This node changes **what is heard**, not what the mouths do. In every replace mode the original
+performance is thrown away and a new one is generated, so the new speech lands on its own cadence
+— close to the original in total duration, and (since phrase-level re-dubbing) anchored per phrase
+to the original word timings, but not frame-accurate against the lips. `blend` mode is the one
+exception: it converts timbre on the *original waveform* without touching timing, so it stays in
+sync by construction, at the cost of still sounding partly like the original speaker.
+
+The fix is not to keep forcing the audio to fit fixed lips. It's to do it the other way round:
+generate the voice you want, then **redraw the mouth to match that voice**. That's what dedicated
+lip-sync models do, and it's the direction they were actually built for.
+
+```
+  ...your LTX-2.5 video  ──→  LTXV Lock Character Voice  ──┬── video ──→  ┐
+                                                           │              ├─→  lip-sync node  ──→  SaveVideo
+                                                           └── audio ──→  ┘
+```
+
+The lip-sync node is a separate custom node — this package doesn't bundle one. Working options,
+all with ComfyUI wrappers:
+
+| Model | Notes |
+|---|---|
+| [LatentSync](https://github.com/bytedance/LatentSync) (ByteDance) | Latent-space; best identity preservation of the three, so faces stay looking like themselves. |
+| [MuseTalk](https://github.com/TMElyralab/MuseTalk) (Tencent) | Real-time (30+ FPS) on a 256×256 face region; fastest. |
+| [Wav2Lip](https://github.com/Rudrabha/Wav2Lip) | Oldest, and still the strongest raw sync (it's trained against a SyncNet discriminator), but lowest output resolution. |
+
+Install one of their ComfyUI wrappers into `ComfyUI/custom_nodes/`, then wire this node's two
+outputs into it. Which one to pick is a quality trade-off, not a correctness one: try LatentSync
+first if faces matter more, Wav2Lip if sync tightness matters more.
+
+**This half has not been run end-to-end here** — no lip-sync node is installed on the pod this was
+developed against. The wiring above is the intended architecture, not a verified run.
 
 ## Honesty about accuracy and testing
 
@@ -217,15 +296,46 @@ parameter, so its output length regularly landed far from the segment's target a
 phase-vocoder stretch to fit, which is what actually produced the artifacts. That's what led
 directly to adding `replace_omnivoice`.
 
-**`replace_omnivoice` mode has not yet been run end-to-end** — it's the newest addition, swapping
-in OmniVoice (verified against a clone of its real source, not guessed) for the voice-generation
-step while reusing the same Demucs/faster-whisper/time-fit/remix pipeline already proven out under
-the other replace modes. Treat your first `replace_omnivoice` run as a calibration pass: expect to
-hit real environment issues (the `transformers>=5.3.0` upgrade risk noted in the install steps,
-checkpoint download/paths, the exact shape of `omnivoice`'s `generate()` return value under real
-GPU inference) the same way every other stage of this project did on first run, and check the
-console output — it prints the transcribed text and timing for every segment it replaces — before
-trusting the result.
+**`replace_omnivoice` mode has been run successfully end-to-end** (single character). The voice
+quality was reported as clearly the best of the replace modes — natural, not robotic — after three
+further fixes found on real runs: OmniVoice's `generate()` defaults to inserting leading silence
+(now `pad_duration=0.0`, which was the cause of the replaced line starting late), Demucs' default
+`htdemucs` leaving enough vocal energy in the "background" residual to hear a ghost of the original
+voice underneath the new one (now the `htdemucs_ft` ensemble), and Light-ASD's frame indices being
+converted with a hardcoded 25 fps when its own ffmpeg extraction actually samples at the video's
+native rate (now read from the file), which was making face matching fail outright on non-25fps
+clips.
+
+**It still does not lip-sync**, and neither do `replace` or `replace_fishaudio` — that's structural,
+not a bug, and it's why the lip-sync stage above exists. Re-dubbing at phrase level (each phrase
+anchored to its own faster-whisper word timestamps, rather than one TTS call per whole speaking
+turn) tightened it noticeably but does not close the gap: an independently generated performance
+paced by a TTS engine will not land syllable-for-syllable on mouth movements it never saw.
+
+### Three approaches that were tried and don't work
+
+Before settling on "generate the voice, then redraw the mouth", three ways of doing it inside LTX
+itself were tried on real runs. All three failed, and they're recorded here so they don't get
+re-attempted:
+
+1. **Freeze the video latent, regenerate only the audio** (per-token `denoise_mask` = 0 on video,
+   1 on audio, via `LTXVConcatAVLatent`'s per-modality nested mask). The plumbing works exactly as
+   documented and the graph runs — but the model was never trained for video-conditioned audio
+   inpainting, and every shipped LTX pipeline runs the opposite direction. Result: audio that
+   ignores the frozen footage entirely.
+2. **`LTXVReferenceAudio`** — inject a reference voice clip as clean context tokens during
+   generation. The model code path is real and generic, but the speaker identity it's meant to
+   carry lives in ID-LoRA weights that exist only for **LTX-2.3**. On base 2.5 the reference is
+   effectively ignored; pushing `identity_guidance_scale` up to compensate produces artifacts
+   rather than the target voice.
+3. **The Dub-It IC-LoRA pipeline** — reads its voice reference from the *same* container as the
+   reference video (so it preserves the source speaker rather than substituting a new one),
+   regenerates video from pure noise, and requires an LTX-2.3-only LoRA. Not applicable.
+
+The common blocker: **no reference-voice / voice-cloning LoRA exists for LTX-2.5 from anyone**, and
+a LoRA only works with the model it was trained on. All three approaches were trying to force
+*audio* to conform to fixed lips, which is the unsupported direction. The lip-sync stage reverses
+it.
 
 If a track never matches or the segments look wrong, adjust `match_threshold` /
 `speaking_threshold` and re-run — recomputing a character's face embedding is cheap, so there's no
