@@ -765,7 +765,11 @@ class LTXVLockCharacterVoice:
             from faster_whisper import WhisperModel
 
             print(f"[LTXVLockCharacterVoice] loading vocal-separation/transcription models for {mode} mode...")
-            separator = Separator(model="htdemucs", device=device)
+            # htdemucs_ft is a 4-model ensemble of the same architecture -- ~4x slower than
+            # htdemucs but meaningfully cleaner vocal isolation, which matters here since any
+            # vocal energy htdemucs leaves in "background" (background = full - vocals) survives
+            # straight into the final mix as an audible ghost of the original voice.
+            separator = Separator(model="htdemucs_ft", device=device)
             # faster-whisper's CUDA backend (ctranslate2) needs CUDA 12.x runtime libs
             # (libcublas.so.12 etc.) which aren't guaranteed present alongside newer CUDA
             # stacks (e.g. cu13 torch builds) -- CPU is plenty fast for these small models.
