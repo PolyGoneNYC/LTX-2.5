@@ -140,6 +140,10 @@ def _identify_character_track(
                 empty_crops += 1
                 continue
             faces = face_app.get(crop)
+            print(f"[LTXVLockCharacterVoice] track {track_idx} sample {pos}: crop shape = {crop.shape}")
+            debug_dir = Path("/tmp/ltxv_voice_lock_debug")
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(debug_dir / f"track{track_idx}_sample{pos}.jpg"), crop)
             if not faces:
                 no_faces += 1
                 continue
