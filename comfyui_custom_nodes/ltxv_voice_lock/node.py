@@ -614,6 +614,43 @@ def _scan_character_folder(folder: str) -> list[tuple[str, Path, Path]]:
     return found
 
 
+def _image_tensor_to_bgr(image_tensor: torch.Tensor) -> np.ndarray:
+    """Convert a ComfyUI IMAGE tensor ([N,H,W,3] float 0-1, RGB) to an OpenCV BGR uint8 frame."""
+    frame = image_tensor[0].cpu().numpy()
+    frame = (frame * 255).clip(0, 255).astype(np.uint8)
+    return frame[:, :, ::-1].copy()
+
+
+def _match_photo_to_character(
+    face_app, query_bgr: np.ndarray, character_folder: str, match_threshold: float
+) -> tuple[str | None, Path | None, float]:
+    """Match a single query photo (e.g. an I2V starting frame) against every character's
+    reference face in character_folder. Returns (name, voice_path, best_score); name is None
+    if nothing cleared match_threshold (or no face was found in the query photo at all).
+    """
+    faces = face_app.get(query_bgr)
+    if not faces:
+        return None, None, -1.0
+    largest = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+    query_embedding = largest.normed_embedding
+
+    best_name, best_voice, best_score = None, None, -1.0
+    for name, face_path, voice_path in _scan_character_folder(character_folder):
+        photo_img = cv2.imread(str(face_path))
+        if photo_img is None:
+            continue
+        ref_faces = face_app.get(photo_img)
+        if not ref_faces:
+            continue
+        ref_largest = max(ref_faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+        score = float(np.dot(query_embedding, ref_largest.normed_embedding))
+        if score > best_score:
+            best_name, best_voice, best_score = name, voice_path, score
+    if best_score < match_threshold:
+        return None, None, best_score
+    return best_name, best_voice, best_score
+
+
 class LTXVLockCharacterVoice:
     @classmethod
     def INPUT_TYPES(cls):
@@ -989,5 +1026,164 @@ class LTXVLockCharacterVoice:
         return (new_video, new_audio)
 
 
-NODE_CLASS_MAPPINGS = {"LTXVLockCharacterVoice": LTXVLockCharacterVoice}
-NODE_DISPLAY_NAME_MAPPINGS = {"LTXVLockCharacterVoice": "LTXV Lock Character Voice"}
+class LTXVDialogueVoiceReference:
+    """Type a line of dialogue and this synthesizes it in an enrolled character's cloned voice,
+    ready to feed into ComfyUI's own LTXVReferenceAudio node as ``reference_audio`` -- so LTX
+    draws the video's lips to match it WHILE generating, instead of fixing sync afterward.
+
+    Why a typed line instead of a raw voice sample: LTXVReferenceAudio injects whatever clip you
+    give it as clean, always-visible context that both the audio and video streams cross-attend
+    to during generation (comfy/ldm/lightricks/av_model.py:708-782) -- so the video's lips get
+    drawn to match whatever is actually IN that clip. A generic voice sample only teaches the
+    model your speaker's timbre; the lips it draws can't match dialogue the sample never
+    contained. A clip that already IS the correct line, spoken in the correct voice, sidesteps
+    that entirely -- the lips drawn to match it are, by construction, the right lips for the
+    right words.
+
+    Pick the character either by wiring `image` (works with the SAME first-frame photo you
+    already feed your I2V subgraph -- it gets face-matched against character_folder) or by
+    typing `character_name` directly, skipping face matching.
+
+    This clip is dry studio audio, not mixed into a scene -- it has none of the room
+    tone/reverb an actual location recording would. If you want that, add a reverb effect to
+    THIS clip afterward as a finishing touch; that's cosmetic, not a fix for wrong lip-sync.
+    """
+
+    CATEGORY = "audio/ltxv"
+    RETURN_TYPES = ("AUDIO", "STRING")
+    RETURN_NAMES = ("reference_audio", "matched_character")
+    FUNCTION = "synthesize"
+    DESCRIPTION = (
+        "Synthesizes typed dialogue in an enrolled character's cloned voice (OmniVoice) for use "
+        "as LTXVReferenceAudio's reference_audio -- steers LTX's own generation to draw lips "
+        "matching this clip while the video is made. Picks the character by face-matching a "
+        "wired photo against character_folder, or by typed character_name. Output is dry studio "
+        "audio with no scene reverb by design; add a reverb effect afterward if you want one."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "dialogue_text": ("STRING", {"multiline": True, "default": ""}),
+                "character_folder": ("STRING", {"default": ""}),
+                "whisper_model": (
+                    "STRING",
+                    {
+                        "default": "base.en",
+                        "tooltip": "Used once to transcribe the matched character's own reference voice clip.",
+                    },
+                ),
+                "omnivoice_model_path": ("STRING", {"default": "k2-fsa/OmniVoice"}),
+                "match_threshold": ("FLOAT", {"default": 0.35, "min": -1.0, "max": 1.0, "step": 0.01}),
+                "device": ("STRING", {"default": "cuda:0"}),
+            },
+            "optional": {
+                "image": (
+                    "IMAGE",
+                    {
+                        "tooltip": (
+                            "Wire the same starting photo you feed your I2V subgraph -- it gets "
+                            "face-matched against character_folder to pick the voice automatically. "
+                            "Leave unconnected if you set character_name instead."
+                        )
+                    },
+                ),
+                "character_name": (
+                    "STRING",
+                    {"default": "", "tooltip": "Skip face-matching and use this character folder name directly."},
+                ),
+            },
+        }
+
+    def synthesize(
+        self,
+        dialogue_text,
+        character_folder,
+        whisper_model,
+        omnivoice_model_path,
+        match_threshold,
+        device,
+        image=None,
+        character_name="",
+    ):
+        if not dialogue_text.strip():
+            raise ValueError("[LTXVDialogueVoiceReference] dialogue_text is empty -- nothing to synthesize.")
+
+        characters = _scan_character_folder(character_folder.strip()) if character_folder.strip() else []
+        if not characters:
+            raise ValueError(
+                f"[LTXVDialogueVoiceReference] no usable characters found in character_folder '{character_folder}'."
+            )
+
+        matched_name = None
+        voice_path = None
+
+        if character_name.strip():
+            wanted = character_name.strip().lower()
+            for name, _face_path, v_path in characters:
+                if name.lower() == wanted:
+                    matched_name, voice_path = name, v_path
+                    break
+            if matched_name is None:
+                raise ValueError(
+                    f"[LTXVDialogueVoiceReference] character_name '{character_name}' not found in '{character_folder}'."
+                )
+        elif image is not None:
+            from insightface.app import FaceAnalysis
+
+            face_app = FaceAnalysis(name="buffalo_l")
+            face_app.prepare(ctx_id=0, det_size=(640, 640))
+            query_bgr = _image_tensor_to_bgr(image)
+            matched_name, voice_path, score = _match_photo_to_character(
+                face_app, query_bgr, character_folder.strip(), match_threshold
+            )
+            if matched_name is None:
+                raise ValueError(
+                    f"[LTXVDialogueVoiceReference] no character in '{character_folder}' matched the "
+                    f"photo above threshold {match_threshold} (best: {score:.3f})."
+                )
+            print(f"[LTXVDialogueVoiceReference] matched '{matched_name}' (similarity {score:.3f})")
+        else:
+            raise ValueError(
+                "[LTXVDialogueVoiceReference] wire an `image` to face-match, or set character_name directly."
+            )
+
+        from faster_whisper import WhisperModel
+
+        # CPU: faster-whisper's CUDA backend needs CUDA-12-specific libs not guaranteed present
+        # alongside newer CUDA stacks -- CPU is plenty fast for transcribing one short reference clip.
+        whisper = WhisperModel(whisper_model, device="cpu")
+        ref_segments, _ = whisper.transcribe(str(voice_path), language="en")
+        ref_text = "".join(s.text for s in ref_segments).strip()
+
+        omnivoice_model = _load_omnivoice_model(omnivoice_model_path, device)
+        prompt = omnivoice_model.create_voice_clone_prompt(str(voice_path), ref_text=ref_text)
+        # No duration= here (unlike _make_omnivoice_synthesizer): there is no existing segment to
+        # match the length of yet -- this clip IS what sets the timing, so let OmniVoice speak it
+        # at its own natural pace. pad_duration=0.0 avoids the leading-silence lag documented in
+        # _make_omnivoice_synthesizer above.
+        audios = omnivoice_model.generate(text=dialogue_text, voice_clone_prompt=prompt, pad_duration=0.0)
+        clip = np.asarray(audios[0], dtype=np.float32)
+        sample_rate = omnivoice_model.sampling_rate
+
+        print(
+            f"[LTXVDialogueVoiceReference] synthesized {len(clip) / sample_rate:.2f}s for "
+            f"'{matched_name}': \"{dialogue_text}\""
+        )
+
+        audio_out = {
+            "waveform": torch.from_numpy(clip).reshape(1, 1, -1),
+            "sample_rate": sample_rate,
+        }
+        return (audio_out, matched_name)
+
+
+NODE_CLASS_MAPPINGS = {
+    "LTXVLockCharacterVoice": LTXVLockCharacterVoice,
+    "LTXVDialogueVoiceReference": LTXVDialogueVoiceReference,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "LTXVLockCharacterVoice": "LTXV Lock Character Voice",
+    "LTXVDialogueVoiceReference": "LTXV Dialogue Voice Reference",
+}
