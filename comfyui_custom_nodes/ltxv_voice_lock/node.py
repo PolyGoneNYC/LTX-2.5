@@ -335,13 +335,18 @@ def _replace_segments_in_waveform(  # noqa: PLR0912
             converted = torchaudio.functional.resample(torch.from_numpy(converted), converted_sr, sample_rate).numpy()
 
         # 4. Time-fit the new speech to the segment's original duration (pitch-preserving). The
-        #    speed adjustment in step 3 should have already gotten close, so only phase-vocoder
-        #    stretch the small residual mismatch -- skip it entirely when close enough, since
-        #    stretching (even a little) is the main source of robotic-sounding artifacts.
+        #    speed adjustment in step 3 should have already gotten close for OpenVoice, but Fish
+        #    Audio's API has no rate/speed/pace parameter at all (verified against its actual
+        #    ServeTTSRequest schema), so its natural output length can be far off target with no
+        #    pre-adjustment available. Rather than stretch arbitrarily far to force an exact fit
+        #    (large phase-vocoder stretches are what make replaced speech sound robotic/metallic),
+        #    cap the stretch to a mild, mostly-inaudible correction and let anything beyond that
+        #    fall through to the pad/truncate below -- a bit of trailing silence or a slightly
+        #    early cutoff reads far more natural than a heavily warped voice.
         if len(converted) > 0:
             rate = len(converted) / target_len
             if abs(rate - 1.0) > 0.03:
-                rate = min(max(rate, 0.4), 2.5)  # avoid pathological stretching on extreme mismatches
+                rate = min(max(rate, 0.85), 1.15)
                 converted = time_stretch(converted, rate=rate)
         converted = converted.astype(np.float64)
         if len(converted) > target_len:
