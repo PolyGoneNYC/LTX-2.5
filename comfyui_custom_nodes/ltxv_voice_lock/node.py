@@ -255,6 +255,42 @@ def _revoice_segments_in_waveform(
     return audio
 
 
+# Phrase-grouping thresholds for _replace_segments_in_waveform, below. A whole speaking turn
+# re-dubbed as one TTS call only matches the turn's overall duration, not where inside it each
+# word actually falls -- re-dubbing at phrase level instead, anchored to each phrase's own
+# original word timestamps, keeps re-dubbed speech much closer to the original mouth movements.
+_PHRASE_GAP_SECONDS = 0.35  # gap between words above which a new phrase starts
+_MIN_PHRASE_SECONDS = 0.15  # phrases shorter than this are dropped -- too short to usefully re-dub
+
+
+def _group_words_into_phrases(words, gap_seconds: float, min_phrase_seconds: float):
+    """Group a flat list of faster-whisper Word objects (each with .start/.end/.word, all in the
+    same local time reference they were transcribed in) into phrases: consecutive words
+    separated by less than `gap_seconds` of silence belong to the same phrase. Returns a list of
+    (phrase_start, phrase_end, phrase_text) tuples, dropping phrases shorter than
+    `min_phrase_seconds`.
+    """
+    groups = []
+    current = []
+    for word in words:
+        if current and (word.start - current[-1].end) > gap_seconds:
+            groups.append(current)
+            current = []
+        current.append(word)
+    if current:
+        groups.append(current)
+
+    phrases = []
+    for group in groups:
+        phrase_start, phrase_end = group[0].start, group[-1].end
+        if phrase_end - phrase_start < min_phrase_seconds:
+            continue
+        text = "".join(w.word for w in group).strip()
+        if text:
+            phrases.append((phrase_start, phrase_end, text))
+    return phrases
+
+
 def _replace_segments_in_waveform(  # noqa: PLR0912
     waveform: np.ndarray,
     sample_rate: int,
@@ -266,13 +302,19 @@ def _replace_segments_in_waveform(  # noqa: PLR0912
 ) -> np.ndarray:
     """Fully replace (not blend) each given segment's voice, keeping any background sound.
 
-    Per segment: separate vocals from background (Demucs), transcribe the isolated vocals
-    (faster-whisper), re-synthesize that text from scratch in the target voice via the injected
-    `synthesize_voice(text, target_duration_seconds) -> (mono_audio, sample_rate)` backend (either
-    OpenVoice's base-speaker TTS + tone-color converter, or Fish Audio's direct zero-shot clone),
-    time-fit the result to the segment's original duration, and rebuild the segment as
-    new-voice + original background. Unlike the tone-color-only blend, nothing of the original
-    voice recording survives into the output.
+    Per speaking turn: separate vocals from background (Demucs) once, transcribe the isolated
+    vocals with word-level timestamps (faster-whisper), group words into phrases anchored to
+    their own original timing, and re-synthesize + place each phrase individually via the
+    injected `synthesize_voice(text, target_duration_seconds) -> (mono_audio, sample_rate)`
+    backend (OpenVoice's base-speaker TTS + tone-color converter, Fish Audio's direct zero-shot
+    clone, or OmniVoice's zero-shot clone). Re-dubbing at phrase level -- rather than the whole
+    turn as one block -- keeps each phrase's onset close to when it was actually spoken instead
+    of only matching the turn's overall duration, which is what makes replaced speech track the
+    original mouth movements. It's still an independently-generated performance, so this isn't
+    perfectly synced the way the tone-color-only blend inherently is. Gaps between phrases
+    (pauses, breaths) are left as original audio -- there's no text to re-dub there, and
+    overwriting them would just substitute the TTS engine's own arbitrary pause length for the
+    original performance's actual one.
     """
     import torchaudio
     from librosa.effects import time_stretch
@@ -290,11 +332,13 @@ def _replace_segments_in_waveform(  # noqa: PLR0912
         end_i = min(end_i, audio.shape[1])
         if end_i <= start_i:
             continue
-        target_len = end_i - start_i
-        segment = audio[:, start_i:end_i]  # [C, T_seg]
+        turn_len = end_i - start_i
+        turn_segment = audio[:, start_i:end_i]  # [C, T_turn]
 
-        # 1. Separate vocals from background. Demucs is stereo-native; duplicate mono up front.
-        seg_tensor = torch.from_numpy(segment).float()
+        # 1. Separate vocals from background once for the whole turn -- more accurate than
+        #    separating small phrase slices individually (Demucs works better with more
+        #    context), and the result is reused for every phrase below.
+        seg_tensor = torch.from_numpy(turn_segment).float()
         if num_channels == 1:
             seg_tensor = seg_tensor.repeat(2, 1)
         resampled_full, stems = separator.separate_tensor(seg_tensor, sr=sample_rate)
@@ -305,68 +349,80 @@ def _replace_segments_in_waveform(  # noqa: PLR0912
         if num_channels == 1:
             background_native = background_native.mean(dim=0, keepdim=True)
         background_native = background_native.cpu().numpy().astype(np.float64)
-        if background_native.shape[1] > target_len:
-            background_native = background_native[:, :target_len]
-        elif background_native.shape[1] < target_len:
-            pad = target_len - background_native.shape[1]
+        if background_native.shape[1] > turn_len:
+            background_native = background_native[:, :turn_len]
+        elif background_native.shape[1] < turn_len:
+            pad = turn_len - background_native.shape[1]
             background_native = np.pad(background_native, ((0, 0), (0, pad)))
 
-        # 2. Transcribe the isolated vocals (faster-whisper wants 16kHz mono float32 when given
-        #    a raw array directly -- it does NOT resample arrays itself, only file paths).
+        # 2. Transcribe the isolated vocals with word-level timestamps (faster-whisper wants
+        #    16kHz mono float32 when given a raw array directly -- it does NOT resample arrays
+        #    itself, only file paths). Word times are local to this turn (0 = turn start).
         vocals_mono = vocals.mean(dim=0)
         vocals_16k = torchaudio.functional.resample(vocals_mono, demucs_sr, 16000).cpu().numpy().astype(np.float32)
-        whisper_segments, _info = whisper_model.transcribe(vocals_16k, language="en")
-        text = "".join(s.text for s in whisper_segments).strip()
-        if not text:
+        whisper_segments, _info = whisper_model.transcribe(vocals_16k, language="en", word_timestamps=True)
+        words = [w for seg in whisper_segments for w in seg.words]
+        if not words:
             print(f"[LTXVLockCharacterVoice] segment {start_s:.2f}s-{end_s:.2f}s: nothing transcribed, leaving as-is")
             continue
 
-        # 3. Generate brand-new speech from that text in the target voice via the injected
-        #    synthesis backend. The OpenVoice backend gets itself close to the segment's
-        #    duration first via its own native `speed` parameter (the model actually pacing its
-        #    delivery) rather than leaning on the phase-vocoder stretch in step 4 to do all the
-        #    work -- large phase-vocoder stretches are what make replaced speech sound
-        #    robotic/metallic, so minimizing how much stretching is needed afterward is the main
-        #    lever for more natural-sounding output.
-        target_duration = target_len / sample_rate
-        converted, converted_sr = synthesize_voice(text, target_duration)
-        converted = np.asarray(converted, dtype=np.float32)
-        if converted_sr != sample_rate:
-            converted = torchaudio.functional.resample(torch.from_numpy(converted), converted_sr, sample_rate).numpy()
+        # 3. Group words into phrases anchored to their own original timing (see the module-
+        #    level comment above these thresholds for why).
+        phrases = _group_words_into_phrases(words, _PHRASE_GAP_SECONDS, _MIN_PHRASE_SECONDS)
 
-        # 4. Time-fit the new speech to the segment's original duration (pitch-preserving). The
-        #    speed adjustment in step 3 should have already gotten close for OpenVoice, but Fish
-        #    Audio's API has no rate/speed/pace parameter at all (verified against its actual
-        #    ServeTTSRequest schema), so its natural output length can be far off target with no
-        #    pre-adjustment available. Rather than stretch arbitrarily far to force an exact fit
-        #    (large phase-vocoder stretches are what make replaced speech sound robotic/metallic),
-        #    cap the stretch to a mild, mostly-inaudible correction and let anything beyond that
-        #    fall through to the pad/truncate below -- a bit of trailing silence or a slightly
-        #    early cutoff reads far more natural than a heavily warped voice.
-        if len(converted) > 0:
-            rate = len(converted) / target_len
-            if abs(rate - 1.0) > 0.03:
-                rate = min(max(rate, 0.85), 1.15)
-                converted = time_stretch(converted, rate=rate)
-        converted = converted.astype(np.float64)
-        if len(converted) > target_len:
-            converted = converted[:target_len]
-        elif len(converted) < target_len:
-            converted = np.pad(converted, (0, target_len - len(converted)))
+        # 4. Re-synthesize and place each phrase individually. Gaps between phrases are
+        #    intentionally left untouched (original audio).
+        for phrase_start_local, phrase_end_local, text in phrases:
+            p_start_i = max(0, int(phrase_start_local * sample_rate))
+            p_end_i = min(turn_len, int(phrase_end_local * sample_rate))
+            if p_end_i <= p_start_i:
+                continue
+            phrase_target_len = p_end_i - p_start_i
+            phrase_original = turn_segment[:, p_start_i:p_end_i]
+            phrase_background = background_native[:, p_start_i:p_end_i]
 
-        # 5. Rebuild the segment: new voice on top of the original background, nothing of the
-        #    original voice recording left in it. Crossfade the edges against the ORIGINAL
-        #    segment audio so the cut in/out doesn't click.
-        new_segment = np.tile(converted, (num_channels, 1)) + background_native
-        n = min(crossfade_n, target_len // 2)
-        if n > 0:
-            fade_in = np.linspace(0, 1, n)
-            fade_out = 1 - fade_in
-            new_segment[:, :n] = new_segment[:, :n] * fade_in + segment[:, :n] * fade_out
-            new_segment[:, -n:] = new_segment[:, -n:] * fade_out + segment[:, -n:] * fade_in
+            # Generate brand-new speech from this phrase's text in the target voice. The
+            # OpenVoice backend gets itself close to the phrase's duration first via its own
+            # native `speed` parameter rather than leaning on the phase-vocoder stretch below to
+            # do all the work; Fish Audio has no rate/speed/pace parameter at all (verified
+            # against its actual ServeTTSRequest schema); OmniVoice takes `duration` directly
+            # (verified against its actual generate() signature).
+            phrase_target_duration = phrase_target_len / sample_rate
+            converted, converted_sr = synthesize_voice(text, phrase_target_duration)
+            converted = np.asarray(converted, dtype=np.float32)
+            if converted_sr != sample_rate:
+                converted = torchaudio.functional.resample(
+                    torch.from_numpy(converted), converted_sr, sample_rate
+                ).numpy()
 
-        audio[:, start_i:end_i] = new_segment
-        print(f'[LTXVLockCharacterVoice] replaced {start_s:.2f}s-{end_s:.2f}s: "{text}"')
+            # Time-fit the new speech to the phrase's original duration (pitch-preserving), with
+            # only a mild correction -- large phase-vocoder stretches are what make replaced
+            # speech sound robotic/metallic, so anything beyond a small residual mismatch falls
+            # through to the pad/truncate below instead of being forced to fit exactly.
+            if len(converted) > 0:
+                rate = len(converted) / phrase_target_len
+                if abs(rate - 1.0) > 0.03:
+                    rate = min(max(rate, 0.85), 1.15)
+                    converted = time_stretch(converted, rate=rate)
+            converted = converted.astype(np.float64)
+            if len(converted) > phrase_target_len:
+                converted = converted[:phrase_target_len]
+            elif len(converted) < phrase_target_len:
+                converted = np.pad(converted, (0, phrase_target_len - len(converted)))
+
+            # Rebuild the phrase: new voice on top of the original background, crossfaded
+            # against the ORIGINAL phrase audio at its edges so the cut in/out doesn't click.
+            new_phrase = np.tile(converted, (num_channels, 1)) + phrase_background
+            n = min(crossfade_n, phrase_target_len // 2)
+            if n > 0:
+                fade_in = np.linspace(0, 1, n)
+                fade_out = 1 - fade_in
+                new_phrase[:, :n] = new_phrase[:, :n] * fade_in + phrase_original[:, :n] * fade_out
+                new_phrase[:, -n:] = new_phrase[:, -n:] * fade_out + phrase_original[:, -n:] * fade_in
+
+            audio[:, start_i + p_start_i : start_i + p_end_i] = new_phrase
+            phrase_start_s, phrase_end_s = start_s + phrase_start_local, start_s + phrase_end_local
+            print(f'[LTXVLockCharacterVoice] replaced {phrase_start_s:.2f}s-{phrase_end_s:.2f}s: "{text}"')
 
     return audio
 
