@@ -48,7 +48,17 @@ def _save_voice(audio: dict, out_path: Path) -> None:
 # --- Pipeline stages, ported from voice_lock/lock_character_voice.py (see that file's more ---
 # --- detailed comments; kept here as a self-contained copy so this folder installs standalone) ---
 
-FPS_ASSUMED_BY_LIGHT_ASD = 25
+
+def _video_fps(video_path: str, fallback: float = 25.0) -> float:
+    """Light-ASD's own frame extraction (ffmpeg -f image2, no -r/-vf fps) samples at the video's
+    native fps, so track frame indices line up 1:1 with native-fps frame numbers. Re-seeking into
+    the original video (for face crops) and converting frame ranges to seconds (for speaking
+    segments) must use that same real fps, or both drift on any video that isn't exactly 25fps.
+    """
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    return fps if fps and fps > 0 else fallback
 
 
 def _run_light_asd(video_path: str, light_asd_repo: str, weight_path: str, work_dir: Path) -> tuple[list, list]:
@@ -86,10 +96,10 @@ def _run_light_asd(video_path: str, light_asd_repo: str, weight_path: str, work_
 
 
 def _crop_face_at_frame(
-    video_path: str, frame_idx: int, track: dict, proc_frame_idx: int, crop_scale: float = 0.40
+    video_path: str, frame_idx: int, track: dict, proc_frame_idx: int, fps: float, crop_scale: float = 0.40
 ) -> np.ndarray:
     cap = cv2.VideoCapture(video_path)
-    cap.set(cv2.CAP_PROP_POS_MSEC, (frame_idx / FPS_ASSUMED_BY_LIGHT_ASD) * 1000)
+    cap.set(cv2.CAP_PROP_POS_MSEC, (frame_idx / fps) * 1000)
     ok, image = cap.read()
     cap.release()
     if not ok:
@@ -112,6 +122,7 @@ def _identify_character_track(
     face_app,
     target_embedding: np.ndarray,
     match_threshold: float,
+    fps: float,
     exclude: set[int] | None = None,
 ) -> tuple[int | None, float]:
     exclude = exclude or set()
@@ -124,7 +135,7 @@ def _identify_character_track(
         similarities = []
         empty_crops = no_faces = 0
         for pos in sample_positions:
-            crop = _crop_face_at_frame(video_path, frame_ids[pos], track, pos)
+            crop = _crop_face_at_frame(video_path, frame_ids[pos], track, pos, fps)
             if crop.size == 0:
                 empty_crops += 1
                 continue
@@ -150,7 +161,7 @@ def _identify_character_track(
 
 
 def _speaking_segments(
-    track: dict, track_scores: list[float], speaking_threshold: float, min_segment_seconds: float
+    track: dict, track_scores: list[float], speaking_threshold: float, min_segment_seconds: float, fps: float
 ) -> list[tuple[float, float]]:
     frame_ids = track["track"]["frame"]
     is_speaking = [s > speaking_threshold for s in track_scores]
@@ -164,7 +175,6 @@ def _speaking_segments(
             seg_start = None
     if seg_start is not None:
         segments.append((seg_start, frame_ids[-1] + 1))
-    fps = FPS_ASSUMED_BY_LIGHT_ASD
     return [(s / fps, e / fps) for s, e in segments if (e - s) / fps >= min_segment_seconds]
 
 
@@ -625,6 +635,7 @@ class LTXVLockCharacterVoice:
 
         video_path = str(work_dir / "input.mp4")
         video.save_to(video_path)
+        video_fps = _video_fps(video_path)
 
         # This node's models (InsightFace, Demucs, Fish Audio, etc.) are loaded with plain
         # PyTorch, not through ComfyUI's own ModelPatcher/model-manager -- so ComfyUI has no way
@@ -713,7 +724,7 @@ class LTXVLockCharacterVoice:
         any_revoiced = False
         for i, target_embedding, voice_path in enrolled:
             track_idx, match_score = _identify_character_track(
-                video_path, tracks, face_app, target_embedding, match_threshold, exclude=claimed_tracks
+                video_path, tracks, face_app, target_embedding, match_threshold, video_fps, exclude=claimed_tracks
             )
             if track_idx is None:
                 print(
@@ -724,7 +735,9 @@ class LTXVLockCharacterVoice:
             claimed_tracks.add(track_idx)
             print(f"[LTXVLockCharacterVoice] character {i}: matched track {track_idx} (similarity {match_score:.3f})")
 
-            segments = _speaking_segments(tracks[track_idx], scores[track_idx], speaking_threshold, min_segment_seconds)
+            segments = _speaking_segments(
+                tracks[track_idx], scores[track_idx], speaking_threshold, min_segment_seconds, video_fps
+            )
             if not segments:
                 print(f"[LTXVLockCharacterVoice] character {i}: no speaking segments found -- skipping.")
                 continue
