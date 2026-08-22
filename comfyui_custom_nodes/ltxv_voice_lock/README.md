@@ -34,7 +34,21 @@ how many characters are enrolled.
      `dl.fbaipublicfiles.com`. This hasn't been verified reachable from every environment — if
      the first `replace`-mode run hangs or fails on a download, that's the thing to check.
 
-   For **`replace_fishaudio` mode** (the default — recommended over `replace`, see below), you
+   For **`replace_omnivoice` mode** (the default — recommended over the other two re-synthesis
+   modes, see below), you need the `omnivoice` package:
+   ```bash
+   pip install omnivoice
+   ```
+   Unlike `fish-speech` below, OmniVoice's published dependencies only require `torch>=2.4` (a
+   floor, not an exact pin), so on an environment that already has a working, newer torch (as
+   ComfyUI's does) a plain install should leave it alone -- still worth confirming with
+   `python -c "import torch; print(torch.__version__)"` before and after. One thing to watch:
+   OmniVoice requires `transformers>=5.3.0`; if ComfyUI's environment has an older `transformers`
+   (e.g. pinned by another custom node), pip *will* try to upgrade it, which can cascade into
+   conflicts the same way the `protobuf` version chain did for `fish-speech` below -- check
+   `pip check` after installing if anything else breaks.
+
+   For **`replace_fishaudio` mode** (kept as an alternative), you
    also need `fish-speech`. **Do not plain `pip install` it** — its `pyproject.toml` hard-pins
    `torch==2.8.0` (an exact version, not a floor like Demucs), which can silently downgrade the
    working torch your ComfyUI install already has and break it. Install with `--no-deps`, then add
@@ -76,7 +90,21 @@ how many characters are enrolled.
    ```
    (Same source repo as the converter checkpoint in step 4 — just a different subfolder.) Skip
    this if you're only using `replace_fishaudio` or `blend` mode.
-6. For **`replace_fishaudio` mode** (the default), download Fish Audio's `s2-pro` checkpoint into
+6. For **`replace_omnivoice` mode** (the default), no manual download step is needed --
+   `omnivoice_model_path` defaults to the HuggingFace Hub repo id `k2-fsa/OmniVoice`, and
+   `OmniVoice.from_pretrained()` downloads and caches it automatically on first use (into HF's
+   usual `~/.cache/huggingface` cache, not this node's `checkpoints/` folder). If you'd rather
+   pre-download it (e.g. for an offline pod), point `omnivoice_model_path` at a local directory
+   instead:
+   ```python
+   from huggingface_hub import snapshot_download
+   snapshot_download(
+       "k2-fsa/OmniVoice",
+       local_dir="ComfyUI/custom_nodes/ltxv_voice_lock/checkpoints/omnivoice",
+   )
+   ```
+   Skip this if you're only using `replace_fishaudio`, `replace`, or `blend` mode.
+7. For **`replace_fishaudio` mode**, download Fish Audio's `s2-pro` checkpoint into
    `ComfyUI/custom_nodes/ltxv_voice_lock/checkpoints/fish_s2pro/`:
    ```python
    from huggingface_hub import snapshot_download
@@ -89,7 +117,7 @@ how many characters are enrolled.
    **Fish Audio Research License**: free for research/non-commercial use, commercial use needs a
    separate license from Fish Audio directly. Skip this if you're only using `replace` or `blend`
    mode.
-7. Restart ComfyUI (or use its "reload custom nodes" option). Search for **"LTXV Lock Character
+8. Restart ComfyUI (or use its "reload custom nodes" option). Search for **"LTXV Lock Character
    Voice"** — it should now appear under `audio/ltxv`.
 
 **Real risk of this path (installing into ComfyUI's own environment, versus the standalone
@@ -112,28 +140,36 @@ code is MIT). See `voice_lock/README.md` for the same note in more detail.
 | `character_photo_2` / `character_voice_2` (and `_3`, `_4`) | IMAGE / AUDIO | Optional additional characters — up to 4 total in one node. Leave unconnected if you only need one. |
 | `light_asd_repo` / `light_asd_weight` | STRING | Paths from step 3 above. |
 | `converter_config` / `converter_ckpt` | STRING | Paths from step 4 above. Only used in `replace` and `blend` modes. |
-| `mode` | COMBO | `replace_fishaudio` (default), `replace`, or `blend`. See below. |
-| `whisper_model` | STRING | faster-whisper model name/size used to transcribe each speaking segment in either replace mode (default `base.en`). Ignored in `blend` mode. |
+| `mode` | COMBO | `replace_omnivoice` (default), `replace_fishaudio`, `replace`, or `blend`. See below. |
+| `whisper_model` | STRING | faster-whisper model name/size used to transcribe each speaking segment in any replace mode (default `base.en`). Ignored in `blend` mode. |
 | `base_speaker_config` / `base_speaker_ckpt` / `base_speaker_se` | STRING | Paths from step 5 above. Only used in `replace` mode. |
-| `fish_llama_checkpoint` / `fish_decoder_checkpoint` / `fish_decoder_config_name` | STRING | Paths from step 6 above. Only used in `replace_fishaudio` mode. |
+| `fish_llama_checkpoint` / `fish_decoder_checkpoint` / `fish_decoder_config_name` | STRING | Paths from step 7 above. Only used in `replace_fishaudio` mode. |
+| `omnivoice_model_path` | STRING | Local directory or HF Hub repo id from step 6 above (default `k2-fsa/OmniVoice`). Only used in `replace_omnivoice` mode. |
 | `match_threshold` | FLOAT | Min face-identity similarity to accept a match (default 0.35). Applies to every character. |
 | `speaking_threshold` | FLOAT | Min Light-ASD score to count as "speaking" (default 0.0). Applies to every character. |
-| `tau` | FLOAT | OpenVoice conversion strength (default 0.3). Only used in `replace` and `blend` modes -- Fish Audio's clone has no equivalent knob. |
+| `tau` | FLOAT | OpenVoice conversion strength (default 0.3). Only used in `replace` and `blend` modes -- neither OmniVoice's nor Fish Audio's clone has an equivalent knob. |
 
 Each enrolled character is matched to its own best-scoring face track (a track already claimed by
 an earlier character can't also be claimed by a later one, so two people can't accidentally get
 merged into the same re-voiced segments).
 
-### `replace_fishaudio` vs `replace` vs `blend` mode
+### `replace_omnivoice` vs `replace_fishaudio` vs `replace` vs `blend` mode
 
-- **`replace_fishaudio`** (default, recommended): for each speaking segment, separates the
+- **`replace_omnivoice`** (default, recommended): for each speaking segment, separates the
   original voice from background sound (Demucs), transcribes what was said (faster-whisper), and
   re-synthesizes that text from scratch directly in your reference voice using
+  [OmniVoice](https://github.com/k2-fsa/OmniVoice)'s zero-shot voice cloning (reference clip +
+  its transcript, one pass). Unlike Fish Audio below, OmniVoice's `generate()` takes a `duration`
+  parameter that natively targets the segment's exact length, so the result needs far less
+  post-hoc time-stretching to fit -- large phase-vocoder stretches are the main source of
+  robotic-sounding replaced speech, so this is the mode expected to sound most natural.
+- **`replace_fishaudio`** (kept as an alternative): the same idea, using
   [Fish Audio](https://github.com/fishaudio/fish-speech)'s zero-shot voice cloning (reference clip
-  + its own transcript, one pass -- no separate tone-color conversion step), then time-fits the
-  result and reinserts it over the preserved background. Fish Audio's own inference automatically
-  transcribes each character's reference voice clip once at enrollment time -- no extra input
-  needed from you.
+  + its own transcript, one pass -- no separate tone-color conversion step) instead of OmniVoice.
+  Fish Audio's API has no duration/speed control at all, so its output length can land far from
+  the segment's target and lean much harder on time-stretching to compensate. Fish Audio's own
+  inference automatically transcribes each character's reference voice clip once at enrollment
+  time -- no extra input needed from you.
 - **`replace`**: the same idea, but using OpenVoice's `BaseSpeakerTTS` (generate neutral speech)
   + tone-color converter (shift its timbre toward the target voice) instead of Fish Audio. Kept as
   a fallback if you can't install `fish-speech` or don't want the extra dependency weight --
@@ -147,7 +183,7 @@ merged into the same re-voiced segments).
   either replace mode's re-synthesized speech sounds too different in cadence from the original
   performance.
 
-Both replace modes are inherently slower and more failure-prone per segment than `blend` (they
+All replace modes are inherently slower and more failure-prone per segment than `blend` (they
 chain several models instead of one), and depend on the transcription being accurate — if
 faster-whisper mishears a line, the resynthesized speech will say the wrong thing. Check the
 console output, which prints the transcribed text for every segment it replaces.
@@ -171,14 +207,25 @@ present on newer CUDA stacks (now forced to CPU), and segment end-times occasion
 samples past the actual audio buffer's length (now clamped). Its OpenVoice-based synthesis was
 reported as sounding noticeably robotic, which led directly to adding `replace_fishaudio`.
 
-**`replace_fishaudio` mode has not yet been run end-to-end** — it's the newest addition, and swaps
-in a completely different, heavier engine (Fish Audio's `fish-speech`) for the voice-generation
+**`replace_fishaudio` mode has been run successfully end-to-end** (single character) after fixing
+several real environment issues along the way (the `--no-deps` install's dependency list, a
+`protobuf` version conflict, a `torchcodec`/`torchaudio` version mismatch, and a cross-run VRAM
+leak from Fish Audio's own `launch_thread_safe_queue()` spawning a new persistent model thread on
+every node execution -- now fixed by caching the built engine). Once matching succeeded, the
+resulting voice was reported as still sounding robotic: Fish Audio's API has no duration/speed
+parameter, so its output length regularly landed far from the segment's target and needed a large
+phase-vocoder stretch to fit, which is what actually produced the artifacts. That's what led
+directly to adding `replace_omnivoice`.
+
+**`replace_omnivoice` mode has not yet been run end-to-end** — it's the newest addition, swapping
+in OmniVoice (verified against a clone of its real source, not guessed) for the voice-generation
 step while reusing the same Demucs/faster-whisper/time-fit/remix pipeline already proven out under
-`replace` mode. Treat your first `replace_fishaudio` run as a calibration pass: expect to hit real
-environment issues (the `--no-deps` install's dependency list, the `protobuf` version conflict
-noted in the install steps, checkpoint paths) the same way every other stage of this project did on
-first run, and check the console output — it prints the transcribed text and timing for every
-segment it replaces — before trusting the result.
+the other replace modes. Treat your first `replace_omnivoice` run as a calibration pass: expect to
+hit real environment issues (the `transformers>=5.3.0` upgrade risk noted in the install steps,
+checkpoint download/paths, the exact shape of `omnivoice`'s `generate()` return value under real
+GPU inference) the same way every other stage of this project did on first run, and check the
+console output — it prints the transcribed text and timing for every segment it replaces — before
+trusting the result.
 
 If a track never matches or the segments look wrong, adjust `match_threshold` /
 `speaking_threshold` and re-run — recomputing a character's face embedding is cheap, so there's no
