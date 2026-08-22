@@ -478,6 +478,42 @@ def _make_fishaudio_synthesizer(engine, ref_audio_bytes: bytes, ref_text: str):
     return synth
 
 
+# OmniVoice's from_pretrained() loads a text tokenizer, an audio tokenizer (Higgs-Audio-v2),
+# and the diffusion LM itself -- expensive enough that, like the Fish Audio engine, it should be
+# built once and reused across node executions rather than reloaded every run.
+_OMNIVOICE_MODEL_CACHE: dict[tuple[str, str], object] = {}
+
+
+def _load_omnivoice_model(model_path: str, device: str):
+    """Load (or reuse a cached) OmniVoice model (k2-fsa/OmniVoice) for zero-shot voice cloning."""
+    cache_key = (model_path, device)
+    cached = _OMNIVOICE_MODEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    from omnivoice import OmniVoice
+
+    model = OmniVoice.from_pretrained(model_path, device_map=device, dtype=torch.float16)
+    _OMNIVOICE_MODEL_CACHE[cache_key] = model
+    return model
+
+
+def _make_omnivoice_synthesizer(model, ref_audio_path: str, ref_text: str):
+    """Build a synthesize_voice(text, target_duration_s) backend using OmniVoice's zero-shot
+    voice cloning. Unlike Fish Audio, OmniVoice's generate() takes a `duration` parameter that
+    directly controls output length, so the caller's later phase-vocoder correction should
+    usually only need to handle a small residual mismatch rather than doing all the work itself.
+    Returns (mono_audio, sample_rate).
+    """
+    prompt = model.create_voice_clone_prompt(ref_audio_path, ref_text=ref_text)
+
+    def synth(text: str, target_duration_s: float) -> tuple[np.ndarray, int]:
+        audios = model.generate(text=text, voice_clone_prompt=prompt, duration=target_duration_s)
+        return np.asarray(audios[0], dtype=np.float32), model.sampling_rate
+
+    return synth
+
+
 MAX_CHARACTERS = 4
 
 
@@ -508,14 +544,18 @@ class LTXVLockCharacterVoice:
                 {"default": "custom_nodes/ltxv_voice_lock/checkpoints/converter/checkpoint.pth"},
             ),
             "mode": (
-                ["replace_fishaudio", "replace", "blend"],
+                ["replace_omnivoice", "replace_fishaudio", "replace", "blend"],
                 {
-                    "default": "replace_fishaudio",
+                    "default": "replace_omnivoice",
                     "tooltip": (
-                        "replace_fishaudio: transcribes each segment and re-synthesizes it from scratch "
-                        "using Fish Audio's zero-shot voice cloning (reference clip + text, one pass), "
+                        "replace_omnivoice: transcribes each segment and re-synthesizes it from scratch "
+                        "using OmniVoice's zero-shot voice cloning (reference clip + text, one pass), "
                         "keeping background sound but replacing 100% of the original voice recording. "
-                        "The most natural-sounding option. Needs the fish_*/whisper_model inputs below. "
+                        "OmniVoice natively targets the segment's exact duration, so it needs the least "
+                        "post-hoc time-stretching of the three re-synthesis options. Needs the "
+                        "omnivoice_model_path/whisper_model inputs below. "
+                        "replace_fishaudio: same idea, using Fish Audio's zero-shot voice cloning "
+                        "instead -- kept as an alternative. Needs the fish_*/whisper_model inputs below. "
                         "replace: same idea, but using OpenVoice's base-speaker TTS + tone-color "
                         "converter instead -- kept as a fallback; tends to sound more robotic. Needs the "
                         "base_speaker_*/whisper_model inputs below. "
@@ -556,6 +596,16 @@ class LTXVLockCharacterVoice:
                 {"default": "custom_nodes/ltxv_voice_lock/checkpoints/fish_s2pro/codec.pth"},
             ),
             "fish_decoder_config_name": ("STRING", {"default": "modded_dac_vq"}),
+            "omnivoice_model_path": (
+                "STRING",
+                {
+                    "default": "k2-fsa/OmniVoice",
+                    "tooltip": (
+                        "Local directory with a pre-downloaded OmniVoice checkpoint, or a "
+                        "HuggingFace Hub repo id to auto-download and cache on first use."
+                    ),
+                },
+            ),
             "match_threshold": (
                 "FLOAT",
                 {"default": 0.35, "min": -1.0, "max": 1.0, "step": 0.01, "tooltip": "Applies to every character."},
@@ -585,11 +635,12 @@ class LTXVLockCharacterVoice:
     CATEGORY = "audio/ltxv"
     DESCRIPTION = (
         "Finds where each enrolled character (up to 4) is speaking (Light-ASD + InsightFace), "
-        "leaving every unenrolled character's dialogue untouched. 'replace_fishaudio' and "
-        "'replace' modes both transcribe each segment and re-synthesize it from scratch in the "
-        "reference voice, keeping background sound but replacing the original voice entirely -- "
-        "they only differ in which TTS/cloning engine generates the new speech (Fish Audio's "
-        "direct zero-shot clone vs. OpenVoice's base-speaker TTS + tone-color converter). 'blend' "
+        "leaving every unenrolled character's dialogue untouched. 'replace_omnivoice', "
+        "'replace_fishaudio', and 'replace' modes all transcribe each segment and re-synthesize "
+        "it from scratch in the reference voice, keeping background sound but replacing the "
+        "original voice entirely -- they only differ in which TTS/cloning engine generates the "
+        "new speech (OmniVoice's zero-shot clone with native duration targeting, Fish Audio's "
+        "direct zero-shot clone, or OpenVoice's base-speaker TTS + tone-color converter). 'blend' "
         "mode is the original tone-color-only conversion, which keeps some of the original "
         "recording's delivery. Face detection runs once for the whole video regardless of how "
         "many characters are enrolled. See this node package's README.md before first use."
@@ -612,6 +663,7 @@ class LTXVLockCharacterVoice:
         fish_llama_checkpoint,
         fish_decoder_checkpoint,
         fish_decoder_config_name,
+        omnivoice_model_path,
         match_threshold,
         speaking_threshold,
         min_segment_seconds,
@@ -696,13 +748,13 @@ class LTXVLockCharacterVoice:
         print(f"[LTXVLockCharacterVoice] found {len(tracks)} face track(s)")
 
         converter = None
-        if mode != "replace_fishaudio":
+        if mode not in ("replace_fishaudio", "replace_omnivoice"):
             converter = ToneColorConverter(converter_config, device=device)
             converter.watermark_model = None  # see voice_lock/lock_character_voice.py for why this
             converter.load_ckpt(converter_ckpt)
 
-        separator = whisper = base_tts = base_source_se = fish_engine = None
-        if mode in ("replace", "replace_fishaudio"):
+        separator = whisper = base_tts = base_source_se = fish_engine = omnivoice_model = None
+        if mode in ("replace", "replace_fishaudio", "replace_omnivoice"):
             from demucs.api import Separator
             from faster_whisper import WhisperModel
 
@@ -724,6 +776,9 @@ class LTXVLockCharacterVoice:
             fish_engine = _load_fish_engine(
                 fish_llama_checkpoint, fish_decoder_checkpoint, fish_decoder_config_name, device
             )
+        elif mode == "replace_omnivoice":
+            print("[LTXVLockCharacterVoice] loading OmniVoice voice-cloning model...")
+            omnivoice_model = _load_omnivoice_model(omnivoice_model_path, device)
 
         audio = components.audio
         sample_rate = int(audio["sample_rate"])  # audio is guaranteed non-None by the check above
@@ -752,7 +807,12 @@ class LTXVLockCharacterVoice:
                 continue
             print(f"[LTXVLockCharacterVoice] character {i}: {len(segments)} segment(s) to {mode}")
 
-            if mode == "replace_fishaudio":
+            if mode == "replace_omnivoice":
+                ref_segments, _ = whisper.transcribe(str(voice_path), language="en")
+                ref_text = "".join(s.text for s in ref_segments).strip()
+                synth = _make_omnivoice_synthesizer(omnivoice_model, str(voice_path), ref_text)
+                waveform = _replace_segments_in_waveform(waveform, sample_rate, segments, separator, whisper, synth)
+            elif mode == "replace_fishaudio":
                 ref_segments, _ = whisper.transcribe(str(voice_path), language="en")
                 ref_text = "".join(s.text for s in ref_segments).strip()
                 synth = _make_fishaudio_synthesizer(fish_engine, voice_path.read_bytes(), ref_text)
