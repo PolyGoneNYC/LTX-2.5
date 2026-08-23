@@ -11,6 +11,7 @@ dependencies = [
     "ltx-core",
     "accelerate>=1.2.1",
     "av>=14.2.1",
+    "faster-whisper>=1.2.1",
     "bitsandbytes >=0.45.2; sys_platform == 'linux'",
     "google-genai>=2.0",
     "huggingface-hub[hf-xet]>=0.31.4",
@@ -71,7 +72,7 @@ build-backend = "hatchling.build"
 target-version = "py311"
 line-length = 120
 # Restrict isort first-party detection to src/ so stray dirs (e.g. wandb/ run output)
-# next to pyproject.toml don't get classified as first-party packages. See ruff#10519.
+# next to pyproject.toml don't get classified as first-party packages.
 src = ["src"]
 
 [tool.ruff.lint]
