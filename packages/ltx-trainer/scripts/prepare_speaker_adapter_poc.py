@@ -167,9 +167,12 @@ def main() -> None:
     config["data"]["preprocessed_data_root"] = str(precomputed)
     config["data"]["num_dataloader_workers"] = 0
 
+    # Validation is disabled for the 50-step smoke run via interval=None. Keep
+    # audio generation enabled so the inherited audio-only validation samples
+    # still satisfy LTX Trainer's config validator.
     config["validation"]["interval"] = None
     config["validation"]["skip_initial_validation"] = True
-    config["validation"]["generate_audio"] = False
+    config["validation"]["generate_audio"] = True
     config["validation"]["generate_video"] = False
 
     config["checkpoints"]["interval"] = max(10, min(25, int(args.steps)))
