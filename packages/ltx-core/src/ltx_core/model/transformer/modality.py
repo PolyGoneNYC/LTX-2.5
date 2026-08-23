@@ -8,13 +8,12 @@ import torch
 
 @dataclass(frozen=True)
 class Modality:
-    """Input data for a single video or audio modality in the transformer.
+    """Input data for a single modality (video or audio) in the transformer.
 
     ``speaker_bias`` and ``speaker_mask`` are optional audio-only conditioning
-    tensors. speaker_bias is already projected to the transformer hidden width;
-    keeping projection outside the base model avoids changing pretrained LTX
-    checkpoint shapes. speaker_mask can restrict the identity bias to the audio
-    tokens for a character's speaking interval.
+    tensors. ``speaker_bias`` is already projected to the transformer hidden
+    width so the pretrained LTX checkpoint shapes remain unchanged.
+    ``speaker_mask`` can restrict the identity bias to selected audio tokens.
     """
 
     latent: torch.Tensor
