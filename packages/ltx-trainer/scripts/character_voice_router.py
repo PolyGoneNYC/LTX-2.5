@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Enroll a character face and route recognized faces to saved LTX speaker embeddings.
 
-POC runtime flow:
-    reference image -> face embedding -> character match -> WavLM speaker embedding
+Final runtime flow:
+    face image -> face embedding -> character match -> saved WavLM speaker embedding
 
-The matched speaker embedding is the same 512-D vector consumed by the experimental
-LTX-2.5 speaker adapter. Face recognition only selects WHICH saved voice identity to
-use; it does not infer a voice from a face.
+Enrollment can use exactly two user files:
+    face.jpg + reference_voice.wav
+
+Face recognition only selects WHICH saved voice identity to use; it does not infer
+a voice from a face.
 """
 
 from __future__ import annotations
@@ -16,7 +18,9 @@ from pathlib import Path
 
 import cv2
 import torch
+import torchaudio
 import typer
+from transformers import Wav2Vec2FeatureExtractor, WavLMForXVector
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
 
@@ -29,6 +33,8 @@ SFACE_URL = (
     "face_recognition_sface_2021dec.onnx"
 )
 DEFAULT_THRESHOLD = 0.363
+DEFAULT_SPEAKER_MODEL = "microsoft/wavlm-base-plus-sv"
+TARGET_SAMPLE_RATE = 16000
 
 
 def _ensure_model(path: Path, url: str) -> Path:
@@ -54,7 +60,6 @@ def _face_embedding(image_path: Path, model_dir: Path) -> torch.Tensor:
     if faces is None or len(faces) == 0:
         raise ValueError(f"No face detected in {image_path}")
 
-    # Prefer the largest face when a frame contains more than one person.
     face = max(faces, key=lambda row: float(row[2] * row[3]))
     recognizer = cv2.FaceRecognizerSF.create(str(recognizer_path), "")
     aligned = recognizer.alignCrop(image, face)
@@ -72,17 +77,68 @@ def _speaker_embedding(path: Path) -> tuple[torch.Tensor, str | None]:
     return embedding, encoder
 
 
+@torch.inference_mode()
+def _speaker_embedding_from_audio(
+    path: Path,
+    model_name: str = DEFAULT_SPEAKER_MODEL,
+    device: str = "cuda",
+    max_seconds: float = 12.0,
+) -> tuple[torch.Tensor, str]:
+    waveform, sample_rate = torchaudio.load(path)
+    if waveform.numel() == 0:
+        raise ValueError(f"Empty audio: {path}")
+    waveform = waveform.float().mean(dim=0)
+    if sample_rate != TARGET_SAMPLE_RATE:
+        waveform = torchaudio.functional.resample(waveform, sample_rate, TARGET_SAMPLE_RATE)
+    waveform = waveform[: int(max_seconds * TARGET_SAMPLE_RATE)]
+
+    torch_device = torch.device(device if torch.cuda.is_available() or not device.startswith("cuda") else "cpu")
+    print(f"Loading speaker encoder {model_name} on {torch_device}...")
+    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_name)
+    model = WavLMForXVector.from_pretrained(model_name).eval().to(torch_device)
+    inputs = feature_extractor(
+        waveform.cpu().numpy(),
+        sampling_rate=TARGET_SAMPLE_RATE,
+        return_tensors="pt",
+        padding=True,
+    )
+    input_values = inputs["input_values"].to(torch_device)
+    attention_mask = inputs.get("attention_mask")
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(torch_device)
+    embedding = model(input_values=input_values, attention_mask=attention_mask).embeddings[0].float().cpu()
+    embedding = torch.nn.functional.normalize(embedding, dim=0).contiguous()
+    return embedding, model_name
+
+
 @app.command()
 def enroll(
     character_id: str,
     face_image: Path = typer.Option(..., "--face", exists=True, dir_okay=False),  # noqa: B008
-    speaker_embedding: Path = typer.Option(..., "--speaker", exists=True, dir_okay=False),  # noqa: B008
+    voice_audio: Path | None = typer.Option(None, "--voice", exists=True, dir_okay=False),  # noqa: B008
+    speaker_embedding: Path | None = typer.Option(None, "--speaker", exists=True, dir_okay=False),  # noqa: B008
     registry_dir: Path = typer.Option(Path("character_profiles"), "--registry"),  # noqa: B008
     model_dir: Path = typer.Option(Path(".models/face_router"), "--models"),  # noqa: B008
+    speaker_model: str = typer.Option(DEFAULT_SPEAKER_MODEL, "--speaker-model"),
+    device: str = typer.Option("cuda", "--device"),
 ) -> None:
-    """Enroll one face identity and attach its saved 512-D speaker embedding."""
+    """Enroll one face and voice. Use --voice for the normal face.jpg + WAV path."""
+    if (voice_audio is None) == (speaker_embedding is None):
+        raise typer.BadParameter("provide exactly one of --voice or --speaker")
+
     face_vector = _face_embedding(face_image.resolve(), model_dir.resolve())
-    voice_vector, voice_encoder = _speaker_embedding(speaker_embedding.resolve())
+    if voice_audio is not None:
+        voice_vector, voice_encoder = _speaker_embedding_from_audio(
+            voice_audio.resolve(),
+            model_name=speaker_model,
+            device=device,
+        )
+        voice_source = str(voice_audio)
+    else:
+        assert speaker_embedding is not None
+        voice_vector, voice_encoder = _speaker_embedding(speaker_embedding.resolve())
+        voice_source = str(speaker_embedding)
+
     if voice_vector.numel() != 512:
         raise ValueError(f"Expected 512-D speaker embedding, got {voice_vector.numel()}")
 
@@ -96,6 +152,7 @@ def enroll(
             "speaker_embedding": voice_vector,
             "speaker_encoder": voice_encoder,
             "face_source": str(face_image),
+            "voice_source": voice_source,
         },
         output,
     )
