@@ -20,12 +20,16 @@ cd "$REPO"
 uv run python packages/ltx-trainer/scripts/character_voice_router.py enroll character1 \
   --face "$FACE" --voice "$VOICE" --registry "$REG" --device cuda
 
-# OmniVoice is only used to create varied TRAINING examples. Final film audio is
-# still generated natively inside LTX, not dubbed by OmniVoice.
-"$COMFY/.venv-cu128/bin/python" packages/ltx-trainer/scripts/bootstrap_voice_dataset.py \
-  "$VOICE" "$DATA" --count 12
+# Reuse the already-generated 12-clip bootstrap dataset on reruns.
+if [ -f "$DATA/dataset.json" ]; then
+  echo "REUSING EXISTING TRAINING CLIPS: $DATA/dataset.json"
+else
+  "$COMFY/.venv-cu128/bin/python" packages/ltx-trainer/scripts/bootstrap_voice_dataset.py \
+    "$VOICE" "$DATA" --count 12
+fi
 
 # Official LTX audio-only preprocessing + WavLM embeddings + 24GB smoke config.
+# Missing BF16 assets are downloaded automatically from the official gated HF repo.
 uv run python packages/ltx-trainer/scripts/prepare_speaker_adapter_poc.py \
   "$DATA/dataset.json" --steps 50 --overwrite
 
