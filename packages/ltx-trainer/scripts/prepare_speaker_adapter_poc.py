@@ -2,44 +2,72 @@
 """Prepare an audio-only LTX-2.5 speaker-adapter POC in one command.
 
 This helper:
-  1. Finds the trainable LTX-2.5 dev BF16 transformer, matching BF16 Gemma4
-     text encoder, and audio VAE under a ComfyUI models directory.
+  1. Finds or downloads the trainable LTX-2.5 dev BF16 transformer, matching
+     BF16 Gemma4 text encoder, and audio VAE under a ComfyUI models directory.
   2. Runs official process_dataset.py for an audio-only T2A dataset.
   3. Computes the 512-D WavLM speaker embedding for every target clip.
   4. Writes a low-VRAM speaker-adapter YAML suitable for a 24 GB GPU smoke run.
 
-It intentionally refuses Comfy-only int8/convrot weights because the LTX PyTorch
-trainer cannot load those files.
+The official Lightricks/LTX-2.5 repo is gated. If access has not already been
+accepted/authenticated, `hf auth login` must be completed once before download.
+Comfy-only int8/convrot weights are not valid for LTX Trainer.
 """
 
 from __future__ import annotations
 
 import argparse
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import yaml
 
-DEV_TRANSFORMER = "ltx-2.5-22b-dev-transformer-bf16.safetensors"
-TEXT_ENCODER = "gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"
-AUDIO_VAE = "ltx-2.5-audio-vae-bf16.safetensors"
+HF_REPO = "Lightricks/LTX-2.5"
+ASSETS = {
+    "diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors": "ltx-2.5-22b-dev-transformer-bf16.safetensors",
+    "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors": "gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
+    "vae/ltx-2.5-audio-vae-bf16.safetensors": "ltx-2.5-audio-vae-bf16.safetensors",
+}
 
 
-def _find_one(root: Path, filename: str) -> Path:
+def _find_one(root: Path, filename: str) -> Path | None:
     hits = list(root.rglob(filename))
-    if not hits:
-        raise FileNotFoundError(
-            f"Missing required training file: {filename}\n"
-            f"Looked under: {root}\n"
-            "The *comfy-int8-convrot* files are not valid for LTX Trainer."
-        )
-    return hits[0].resolve()
+    return hits[0].resolve() if hits else None
 
 
 def _run(cmd: list[str]) -> None:
     print("\n$ " + " ".join(cmd))
     subprocess.run(cmd, check=True)
+
+
+def _ensure_training_assets(root: Path) -> tuple[Path, Path, Path]:
+    root.mkdir(parents=True, exist_ok=True)
+    found = {name: _find_one(root, name) for name in ASSETS.values()}
+    missing_repo_paths = [repo_path for repo_path, name in ASSETS.items() if found[name] is None]
+
+    if missing_repo_paths:
+        hf = shutil.which("hf")
+        if hf is None:
+            raise RuntimeError("Hugging Face CLI `hf` was not found. Run: uv sync")
+        print("\nMissing BF16 training assets. Downloading from official Lightricks/LTX-2.5...")
+        print("This is roughly 69 GB total if none of the three files are already present.")
+        try:
+            _run([hf, "download", HF_REPO, *missing_repo_paths, "--local-dir", str(root)])
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                "Could not download the gated LTX-2.5 BF16 training files.\n"
+                "1) Accept access to Lightricks/LTX-2.5 on Hugging Face.\n"
+                "2) Run: hf auth login\n"
+                "3) Re-run this script."
+            ) from exc
+
+    transformer = _find_one(root, ASSETS["diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors"])
+    text_encoder = _find_one(root, ASSETS["text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"])
+    audio_vae = _find_one(root, ASSETS["vae/ltx-2.5-audio-vae-bf16.safetensors"])
+    if not transformer or not text_encoder or not audio_vae:
+        raise FileNotFoundError("BF16 training asset download completed but one or more expected files are still missing")
+    return transformer, text_encoder, audio_vae
 
 
 def main() -> None:
@@ -62,9 +90,7 @@ def main() -> None:
     precomputed = dataset_root / ".precomputed"
     comfy_models = Path(args.comfy_models).expanduser().resolve()
 
-    transformer = _find_one(comfy_models, DEV_TRANSFORMER)
-    text_encoder = _find_one(comfy_models, TEXT_ENCODER)
-    audio_vae = _find_one(comfy_models, AUDIO_VAE)
+    transformer, text_encoder, audio_vae = _ensure_training_assets(comfy_models)
 
     print("FOUND TRAINING ASSETS")
     print(f"  transformer: {transformer}")
@@ -128,8 +154,6 @@ def main() -> None:
     config["optimization"]["optimizer_type"] = "adamw8bit"
     config["optimization"]["enable_gradient_checkpointing"] = True
 
-    # 32 GB is the documented INT8 low-VRAM target. For a 24 GB 4090 smoke run,
-    # use INT4 for the frozen 22B base and train only the ~1M speaker projection.
     config["acceleration"]["mixed_precision_mode"] = "bf16"
     config["acceleration"]["quantization"] = "int4-quanto"
     config["acceleration"]["load_text_encoder_in_8bit"] = True
