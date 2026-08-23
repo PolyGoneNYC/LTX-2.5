@@ -2,18 +2,15 @@
 """Precompute fixed speaker embeddings for LTX-2.5 voice-adapter training.
 
 Each dataset row points to:
-  * the normal target media used by LTX training (``media_path`` or ``video``), and
+  * the normal target media used by LTX training (``audio``, ``media_path`` or ``video``), and
   * a separate clean reference recording in ``speaker_reference``.
 
-The reference recording SHOULD be a different utterance from the target clip.  That
-forces the adapter to learn speaker identity rather than memorizing the target words,
-prosody, or room acoustics.
+The reference recording SHOULD be a different utterance from the target clip when
+possible. That forces a universal adapter to learn speaker identity rather than
+memorizing target words, prosody or room acoustics.
 
-The output directory mirrors the normal latent directory layout, so
-``PrecomputedDataset`` can pair files by relative path:
-
-    .precomputed/latents/scene_001.pt
-    .precomputed/speaker_embeddings/scene_001.pt
+The output directory mirrors the normal latent directory layout so
+``PrecomputedDataset`` can pair files by relative path.
 
 Default encoder: microsoft/wavlm-base-plus-sv (speaker-verification X-vectors).
 """
@@ -36,7 +33,7 @@ from transformers import Wav2Vec2FeatureExtractor, WavLMForXVector
 console = Console()
 app = typer.Typer(pretty_exceptions_enable=False, no_args_is_help=True)
 
-MEDIA_COLUMNS = ("media_path", "video")
+MEDIA_COLUMNS = ("audio", "media_path", "video")
 DEFAULT_SPEAKER_COLUMN = "speaker_reference"
 DEFAULT_MODEL = "microsoft/wavlm-base-plus-sv"
 TARGET_SAMPLE_RATE = 16000
@@ -86,7 +83,6 @@ def _output_relative(value: str, base_dir: Path) -> Path:
     try:
         return path.resolve().relative_to(base_dir.resolve())
     except ValueError:
-        # Absolute media outside the dataset tree still needs a deterministic safe name.
         return Path(path.name)
 
 
@@ -94,7 +90,7 @@ def _load_reference_audio(path: Path, max_seconds: float) -> torch.Tensor:
     waveform, sample_rate = torchaudio.load(path)
     if waveform.numel() == 0:
         raise ValueError(f"Empty audio: {path}")
-    waveform = waveform.float().mean(dim=0)  # mono [T]
+    waveform = waveform.float().mean(dim=0)
     if sample_rate != TARGET_SAMPLE_RATE:
         waveform = torchaudio.functional.resample(waveform, sample_rate, TARGET_SAMPLE_RATE)
     if max_seconds > 0:
@@ -139,7 +135,7 @@ def main(
     naming_column: str | None = typer.Option(
         None,
         "--naming-column",
-        help="Target-media column used to mirror latent filenames; auto-detects media_path/video by default.",
+        help="Target-media column used to mirror latent filenames; auto-detects audio/media_path/video by default.",
     ),
     model_name: str = typer.Option(DEFAULT_MODEL, "--model"),
     device: str = typer.Option("cuda", "--device"),
@@ -191,7 +187,7 @@ def main(
                 out_path,
             )
             written += 1
-        except Exception as exc:  # keep preprocessing long datasets usable
+        except Exception as exc:
             console.print(f"[red]Failed[/] {ref_path}: {exc}")
             failed += 1
 
