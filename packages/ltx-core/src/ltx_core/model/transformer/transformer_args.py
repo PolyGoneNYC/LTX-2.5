@@ -43,6 +43,66 @@ def apply_keyframes_absolute_embedding(
     return hidden_states + mask * embedding.to(dtype=hidden_states.dtype)
 
 
+def apply_speaker_conditioning(
+    hidden_states: torch.Tensor,
+    speaker_bias: torch.Tensor | None,
+    speaker_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Inject a pre-projected speaker identity bias into transformer tokens.
+
+    ``speaker_bias`` lives in transformer hidden space, so it is applied after
+    the modality latent has passed through ``patchify_proj`` and before the
+    first self/cross-attention block.  That keeps the base checkpoint shapes
+    unchanged while allowing a small separately-trained speaker adapter to
+    influence every audio denoising step.
+
+    Accepted speaker-bias shapes are ``(D,)``, ``(B,D)``, ``(1,1,D)``,
+    ``(B,1,D)`` or ``(B,T,D)``.  ``speaker_mask`` is optional and may be
+    ``(T,)``, ``(B,T)`` or ``(B,T,1)``; floating masks are preserved so a
+    caller can use soft speaking-region weights rather than only 0/1 gates.
+    """
+    if speaker_bias is None:
+        return hidden_states
+
+    batch_size, token_count, hidden_dim = hidden_states.shape
+    bias = speaker_bias.to(device=hidden_states.device, dtype=hidden_states.dtype)
+    if bias.ndim == 1:
+        bias = bias.view(1, 1, -1)
+    elif bias.ndim == 2:
+        bias = bias.unsqueeze(1)
+    elif bias.ndim != 3:
+        raise ValueError(f"speaker_bias must have 1, 2 or 3 dimensions, got shape {tuple(bias.shape)}")
+
+    if bias.shape[-1] != hidden_dim:
+        raise ValueError(
+            f"speaker_bias hidden dimension {bias.shape[-1]} does not match projected token width {hidden_dim}"
+        )
+    if bias.shape[0] not in (1, batch_size):
+        raise ValueError(f"speaker_bias batch dimension must be 1 or {batch_size}, got {bias.shape[0]}")
+    if bias.shape[1] not in (1, token_count):
+        raise ValueError(f"speaker_bias token dimension must be 1 or {token_count}, got {bias.shape[1]}")
+
+    if speaker_mask is None:
+        return hidden_states + bias
+
+    mask = speaker_mask.to(device=hidden_states.device, dtype=hidden_states.dtype)
+    if mask.ndim == 1:
+        mask = mask.view(1, -1, 1)
+    elif mask.ndim == 2:
+        mask = mask.unsqueeze(-1)
+    elif mask.ndim != 3:
+        raise ValueError(f"speaker_mask must have 1, 2 or 3 dimensions, got shape {tuple(mask.shape)}")
+
+    if mask.shape[-1] != 1:
+        raise ValueError(f"speaker_mask last dimension must be 1, got {mask.shape[-1]}")
+    if mask.shape[0] not in (1, batch_size):
+        raise ValueError(f"speaker_mask batch dimension must be 1 or {batch_size}, got {mask.shape[0]}")
+    if mask.shape[1] not in (1, token_count):
+        raise ValueError(f"speaker_mask token dimension must be 1 or {token_count}, got {mask.shape[1]}")
+
+    return hidden_states + bias * mask
+
+
 @dataclass(frozen=True)
 class TransformerArgs:
     x: torch.Tensor
@@ -267,6 +327,7 @@ class TransformerArgsPreprocessor:
     ) -> TransformerArgs:
         x = self.patchify_proj(modality.latent)
         x = apply_keyframes_absolute_embedding(x, modality.keyframes_mask, self.keyframes_embedding_provider)
+        x = apply_speaker_conditioning(x, modality.speaker_bias, modality.speaker_mask)
         batch_size = x.shape[0]
         timestep, embedded_timestep = self._prepare_timestep(
             modality.timesteps, self.adaln, batch_size, modality.latent.dtype
