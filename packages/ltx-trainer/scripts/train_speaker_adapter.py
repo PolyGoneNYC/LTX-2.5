@@ -1,27 +1,31 @@
 #!/usr/bin/env python
 """Train the first LTX-2.5 in-diffusion speaker-identity adapter.
 
-This is intentionally a small, frozen-base experiment:
+Frozen-base architecture:
 
     WavLM speaker x-vector (512-D)
         -> SpeakerEmbeddingConditioner (~1M trainable params)
-        -> speaker_bias on LTX audio tokens
+        -> speaker_bias * speech-token mask on LTX audio tokens
         -> normal LTX audio self-attention + A/V cross-attention
         -> native LTX audio/video generation
 
-The 19B LTX transformer stays frozen.  Only the speaker projection is optimized.
-That makes the experiment feasible on a 32 GB 5090 with the same base-model
-quantization used by low-VRAM LoRA training.
+The 19B LTX transformer stays frozen. Only the speaker projection is optimized.
+The speaker mask is deliberately zero during music/ambience-only intervals, so
+LTX remains free to generate those acoustics natively instead of baking speaker
+identity into the whole soundtrack.
 
 Dataset requirements
 --------------------
-Use the normal joint A/V preprocessing first (latents + audio_latents +
-conditions), then run ``compute_speaker_embeddings.py`` so the precomputed tree
-also contains ``speaker_embeddings`` with matching relative .pt paths.
+Normal joint A/V preprocessing must already provide:
+    latents/
+    audio_latents/
+    conditions/
 
-For this first smoke-train the speaker identity is applied to all audio tokens.
-The core API already supports ``speaker_mask``; a later dataset pass will add
-word/VAD masks so music and ambience tokens can be left completely unconditioned.
+Then run:
+    scripts/compute_speaker_embeddings.py -> speaker_embeddings/
+    scripts/compute_speaker_masks.py      -> speaker_masks/
+
+All directories must mirror the same relative .pt paths.
 """
 
 from __future__ import annotations
@@ -61,9 +65,7 @@ class SpeakerAdapterTrainer(LtxvTrainer):
         super().__init__(trainer_config)
 
     def _load_models(self) -> None:
-        # Stock loader may quantize the frozen base model according to the config.
         super()._load_models()
-
         if not self._transformer.model_type.is_audio_enabled():
             raise ValueError("Speaker-adapter training requires an audio-enabled LTX checkpoint")
 
@@ -71,8 +73,6 @@ class SpeakerAdapterTrainer(LtxvTrainer):
             speaker_embedding_dim=self._speaker_embedding_dim,
             audio_hidden_dim=self._transformer.audio_inner_dim,
         )
-        # Attach it to the transformer so Accelerate moves/wraps it together with the
-        # frozen LTX model and checkpoint unwrapping has one canonical owner.
         setattr(self._transformer, ADAPTER_MODULE_NAME, adapter)
         logger.info(
             "Attached speaker adapter: %d -> %d (%d trainable parameters)",
@@ -82,8 +82,8 @@ class SpeakerAdapterTrainer(LtxvTrainer):
         )
 
     def _collect_trainable_params(self) -> None:
-        # Override the normal full/LoRA branches completely. The base 19B model is
-        # frozen and there are no PEFT LoRA layers in this experiment.
+        # Do not install LoRA even when model.training_mode is "lora". That config
+        # value is retained only so the stock low-VRAM/quantization code path stays available.
         self._transformer.requires_grad_(False)
         adapter: SpeakerEmbeddingConditioner = getattr(self._transformer, ADAPTER_MODULE_NAME)
         adapter.requires_grad_(True)
@@ -95,11 +95,11 @@ class SpeakerAdapterTrainer(LtxvTrainer):
             data_sources = self._config.training_strategy.get_data_sources().copy()
             if "audio_latents" not in data_sources.values():
                 raise ValueError(
-                    "Speaker-adapter training needs joint audio/video data. Set "
-                    "training_strategy.name=text_to_video and with_audio=true (or use an "
-                    "equivalent audio-enabled strategy)."
+                    "Speaker-adapter training needs joint audio/video data. Use an audio-enabled "
+                    "training strategy (for example flexible with audio.is_generated=true)."
                 )
             data_sources["speaker_embeddings"] = "speaker_embeddings"
+            data_sources["speaker_masks"] = "speaker_masks"
             self._dataset = PrecomputedDataset(
                 self._config.data.preprocessed_data_root,
                 data_sources=data_sources,
@@ -122,8 +122,23 @@ class SpeakerAdapterTrainer(LtxvTrainer):
         )
         self._dataloader = self._accelerator.prepare(dataloader)
 
+    @staticmethod
+    def _validate_speaker_mask(mask: Tensor, audio_token_count: int, batch_size: int) -> Tensor:
+        if mask.ndim == 1:
+            mask = mask.unsqueeze(0)
+        if mask.ndim != 2:
+            raise ValueError(f"speaker_masks/mask must collate to [B,T], got {tuple(mask.shape)}")
+        if mask.shape[0] != batch_size:
+            raise ValueError(f"speaker mask batch {mask.shape[0]} != audio batch {batch_size}")
+        if mask.shape[1] != audio_token_count:
+            raise ValueError(
+                f"speaker mask token count {mask.shape[1]} != LTX audio token count {audio_token_count}; "
+                "regenerate speaker_masks from the same audio_latents used for this training run"
+            )
+        return mask.float().clamp_(0.0, 1.0)
+
     def _training_step(self, batch: dict[str, dict[str, Tensor]]) -> TrainingStepOutput:
-        # Keep the stock text-conditioning path exactly the same as LtxvTrainer.
+        # Preserve the stock LTX text-conditioning path.
         conditions = batch["conditions"]
         if "video_prompt_embeds" in conditions:
             video_features = conditions["video_prompt_embeds"]
@@ -132,8 +147,8 @@ class SpeakerAdapterTrainer(LtxvTrainer):
             video_features = conditions["prompt_embeds"]
             audio_features = conditions["prompt_embeds"]
 
-        mask = conditions["prompt_attention_mask"]
-        additive_mask = convert_to_additive_mask(mask, video_features.dtype)
+        attention = conditions["prompt_attention_mask"]
+        additive_mask = convert_to_additive_mask(attention, video_features.dtype)
         video_embeds, audio_embeds, attention_mask = self._embeddings_processor.create_embeddings(
             video_features,
             audio_features,
@@ -155,8 +170,16 @@ class SpeakerAdapterTrainer(LtxvTrainer):
                 f"got {tuple(speaker_embedding.shape)}"
             )
 
-        # After Accelerate wrapping, use the unwrapped object only to locate the
-        # adapter module; its parameters are the same Parameters owned by the wrapped model.
+        batch_size, audio_token_count = model_inputs.audio.latent.shape[:2]
+        speaker_mask = self._validate_speaker_mask(
+            batch["speaker_masks"]["mask"],
+            audio_token_count=audio_token_count,
+            batch_size=batch_size,
+        ).to(device=model_inputs.audio.latent.device, dtype=model_inputs.audio.latent.dtype)
+
+        # Skip identity injection entirely for samples in which Whisper/VAD found no speech.
+        # Keeping zero-speech examples is useful: they explicitly teach that music/ambience
+        # should remain identical to base LTX behavior when there is no speaker to identify.
         unwrapped = self._accelerator.unwrap_model(self._transformer)
         adapter: SpeakerEmbeddingConditioner = getattr(unwrapped, ADAPTER_MODULE_NAME)
         condition = CharacterVoiceCondition(
@@ -164,14 +187,12 @@ class SpeakerAdapterTrainer(LtxvTrainer):
             embedding=speaker_embedding,
             strength=1.0,
         )
-        speaker_bias = adapter.project_condition(
-            condition,
-            batch_size=model_inputs.audio.latent.shape[0],
-        )
+        speaker_bias = adapter.project_condition(condition, batch_size=batch_size)
+
         model_inputs.audio = replace(
             model_inputs.audio,
             speaker_bias=speaker_bias,
-            speaker_mask=None,  # Phase 1 smoke train; VAD/token masks are Phase 2.
+            speaker_mask=speaker_mask,
         )
 
         video_pred, audio_pred = self._transformer(
@@ -188,7 +209,6 @@ class SpeakerAdapterTrainer(LtxvTrainer):
         return TrainingStepOutput(loss=loss, sigma=sigma)
 
     def _load_checkpoint(self) -> None:
-        """Load an adapter-only safetensors checkpoint when configured."""
         checkpoint = self._config.model.load_checkpoint
         if not checkpoint:
             self._resume_state = (0, None)
@@ -206,11 +226,11 @@ class SpeakerAdapterTrainer(LtxvTrainer):
         adapter: SpeakerEmbeddingConditioner = getattr(self._transformer, ADAPTER_MODULE_NAME)
         adapter.load_state_dict(adapter_state, strict=True)
         self._loaded_checkpoint_path = checkpoint_path
-        self._resume_state = (0, None)  # weights-only resume for the research POC
+        self._resume_state = (0, None)
         logger.info("Loaded speaker adapter from %s", checkpoint_path)
 
     def _save_checkpoint(self) -> Path:
-        """Save only the ~1M-parameter speaker adapter, never the frozen 19B base."""
+        """Save only the speaker adapter, never the frozen 19B base model."""
         output_dir = Path(self._config.output_dir).expanduser().resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
         step = max(self._global_step, 0)
@@ -227,6 +247,7 @@ class SpeakerAdapterTrainer(LtxvTrainer):
                 "speaker_embedding_dim": str(adapter.speaker_embedding_dim),
                 "audio_hidden_dim": str(adapter.audio_hidden_dim),
                 "speaker_encoder": "microsoft/wavlm-base-plus-sv",
+                "speaker_mask": "target-speech-token mask",
                 "injection": "audio projected tokens before transformer attention",
             },
         )
@@ -252,7 +273,7 @@ def main(
     if trainer_config.validation.interval:
         console.print(
             "[yellow]Warning:[/] standard validation does not yet inject speaker embeddings. "
-            "Set validation.interval: 0 for the first adapter run."
+            "Set validation.interval: null for the first adapter run."
         )
 
     trainer = SpeakerAdapterTrainer(
