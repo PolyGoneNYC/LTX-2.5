@@ -1,31 +1,34 @@
 #!/usr/bin/env python
-"""Train the first LTX-2.5 in-diffusion speaker-identity adapter.
+"""Train an LTX-2.5 in-diffusion speaker-identity adapter.
 
 Frozen-base architecture:
 
     WavLM speaker x-vector (512-D)
         -> SpeakerEmbeddingConditioner (~1M trainable params)
-        -> speaker_bias * speech-token mask on LTX audio tokens
-        -> normal LTX audio self-attention + A/V cross-attention
-        -> native LTX audio/video generation
+        -> global speaker bias on LTX audio tokens
+        -> normal LTX audio self-attention / text attention
+        -> native LTX audio generation
 
-The 19B LTX transformer stays frozen. Only the speaker projection is optimized.
-The speaker mask is deliberately zero during music/ambience-only intervals, so
-LTX remains free to generate those acoustics natively instead of baking speaker
-identity into the whole soundtrack.
+The 19B LTX transformer stays frozen. Only the small speaker projection is
+optimized. The default ``global`` mode is deliberately compatible with real
+inference: the speaker identity is available before generation, while future
+speech timestamps are not. LTX therefore learns that the identity vector affects
+spoken voice while its frozen base model remains responsible for timing, music,
+ambience, distance and room acoustics.
+
+Audio-only T2A training is supported and is the recommended first path because
+speaker identity does not need to relearn LTX's existing video/lip-sync ability.
+Joint AV training remains supported as well.
 
 Dataset requirements
 --------------------
-Normal joint A/V preprocessing must already provide:
-    latents/
+Preprocessing must provide:
     audio_latents/
     conditions/
+    speaker_embeddings/
 
-Then run:
-    scripts/compute_speaker_embeddings.py -> speaker_embeddings/
-    scripts/compute_speaker_masks.py      -> speaker_masks/
-
-All directories must mirror the same relative .pt paths.
+Optional legacy/diagnostic mode ``target_speech`` additionally requires:
+    speaker_masks/
 """
 
 from __future__ import annotations
@@ -55,13 +58,22 @@ app = typer.Typer(pretty_exceptions_enable=False, no_args_is_help=True)
 
 DEFAULT_SPEAKER_EMBEDDING_DIM = 512
 ADAPTER_MODULE_NAME = "speaker_embedding_conditioner"
+MASK_MODES = ("global", "target_speech")
 
 
 class SpeakerAdapterTrainer(LtxvTrainer):
-    """LTX trainer variant that updates only the speaker-conditioning adapter."""
+    """LTX trainer variant that updates only speaker conditioning."""
 
-    def __init__(self, trainer_config: LtxTrainerConfig, speaker_embedding_dim: int = DEFAULT_SPEAKER_EMBEDDING_DIM):
+    def __init__(
+        self,
+        trainer_config: LtxTrainerConfig,
+        speaker_embedding_dim: int = DEFAULT_SPEAKER_EMBEDDING_DIM,
+        speaker_mask_mode: str = "global",
+    ) -> None:
+        if speaker_mask_mode not in MASK_MODES:
+            raise ValueError(f"speaker_mask_mode must be one of {MASK_MODES}, got {speaker_mask_mode!r}")
         self._speaker_embedding_dim = speaker_embedding_dim
+        self._speaker_mask_mode = speaker_mask_mode
         super().__init__(trainer_config)
 
     def _load_models(self) -> None:
@@ -75,15 +87,16 @@ class SpeakerAdapterTrainer(LtxvTrainer):
         )
         setattr(self._transformer, ADAPTER_MODULE_NAME, adapter)
         logger.info(
-            "Attached speaker adapter: %d -> %d (%d trainable parameters)",
+            "Attached speaker adapter: %d -> %d (%d trainable parameters), mask_mode=%s",
             self._speaker_embedding_dim,
             self._transformer.audio_inner_dim,
             sum(p.numel() for p in adapter.parameters()),
+            self._speaker_mask_mode,
         )
 
     def _collect_trainable_params(self) -> None:
         # Do not install LoRA even when model.training_mode is "lora". That config
-        # value is retained only so the stock low-VRAM/quantization code path stays available.
+        # value is retained only so the stock low-VRAM/quantization path stays available.
         self._transformer.requires_grad_(False)
         adapter: SpeakerEmbeddingConditioner = getattr(self._transformer, ADAPTER_MODULE_NAME)
         adapter.requires_grad_(True)
@@ -95,11 +108,12 @@ class SpeakerAdapterTrainer(LtxvTrainer):
             data_sources = self._config.training_strategy.get_data_sources().copy()
             if "audio_latents" not in data_sources.values():
                 raise ValueError(
-                    "Speaker-adapter training needs joint audio/video data. Use an audio-enabled "
-                    "training strategy (for example flexible with audio.is_generated=true)."
+                    "Speaker-adapter training needs an audio modality. For the recommended audio-only path use a flexible "
+                    "strategy with audio.is_generated=true and audio.latents_dir='audio_latents'."
                 )
             data_sources["speaker_embeddings"] = "speaker_embeddings"
-            data_sources["speaker_masks"] = "speaker_masks"
+            if self._speaker_mask_mode == "target_speech":
+                data_sources["speaker_masks"] = "speaker_masks"
             self._dataset = PrecomputedDataset(
                 self._config.data.preprocessed_data_root,
                 data_sources=data_sources,
@@ -171,15 +185,14 @@ class SpeakerAdapterTrainer(LtxvTrainer):
             )
 
         batch_size, audio_token_count = model_inputs.audio.latent.shape[:2]
-        speaker_mask = self._validate_speaker_mask(
-            batch["speaker_masks"]["mask"],
-            audio_token_count=audio_token_count,
-            batch_size=batch_size,
-        ).to(device=model_inputs.audio.latent.device, dtype=model_inputs.audio.latent.dtype)
+        speaker_mask = None
+        if self._speaker_mask_mode == "target_speech":
+            speaker_mask = self._validate_speaker_mask(
+                batch["speaker_masks"]["mask"],
+                audio_token_count=audio_token_count,
+                batch_size=batch_size,
+            ).to(device=model_inputs.audio.latent.device, dtype=model_inputs.audio.latent.dtype)
 
-        # Skip identity injection entirely for samples in which Whisper/VAD found no speech.
-        # Keeping zero-speech examples is useful: they explicitly teach that music/ambience
-        # should remain identical to base LTX behavior when there is no speaker to identify.
         unwrapped = self._accelerator.unwrap_model(self._transformer)
         adapter: SpeakerEmbeddingConditioner = getattr(unwrapped, ADAPTER_MODULE_NAME)
         condition = CharacterVoiceCondition(
@@ -243,12 +256,13 @@ class SpeakerAdapterTrainer(LtxvTrainer):
             state,
             str(out_path),
             metadata={
-                "format": "ltx-2.5-speaker-adapter-v1",
+                "format": "ltx-2.5-speaker-adapter-v2",
                 "speaker_embedding_dim": str(adapter.speaker_embedding_dim),
                 "audio_hidden_dim": str(adapter.audio_hidden_dim),
                 "speaker_encoder": "microsoft/wavlm-base-plus-sv",
-                "speaker_mask": "target-speech-token mask",
+                "speaker_mask": self._speaker_mask_mode,
                 "injection": "audio projected tokens before transformer attention",
+                "supports_audio_only_training": "true",
             },
         )
         logger.info("Saved speaker adapter to %s", out_path)
@@ -263,9 +277,17 @@ def main(
         "--speaker-embedding-dim",
         help="512 for microsoft/wavlm-base-plus-sv",
     ),
+    speaker_mask_mode: str = typer.Option(
+        "global",
+        "--speaker-mask-mode",
+        help="global (recommended for real inference) or target_speech (diagnostic/training-only timing mask)",
+    ),
     disable_progress_bars: bool = typer.Option(False, "--disable-progress-bars"),
 ) -> None:
     """Train only the LTX-2.5 speaker-conditioning projection."""
+    if speaker_mask_mode not in MASK_MODES:
+        raise typer.BadParameter(f"must be one of {MASK_MODES}", param_hint="--speaker-mask-mode")
+
     with config_path.open("r", encoding="utf-8") as f:
         config_data = yaml.safe_load(f)
     trainer_config = LtxTrainerConfig(**config_data)
@@ -279,6 +301,7 @@ def main(
     trainer = SpeakerAdapterTrainer(
         trainer_config,
         speaker_embedding_dim=speaker_embedding_dim,
+        speaker_mask_mode=speaker_mask_mode,
     )
     trainer.train(disable_progress_bars=disable_progress_bars)
 
